@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +26,7 @@ from bridge_core import (
     find_session_file,
     latest_complete_turn,
     latest_final_message,
+    log_event,
     qq_safe_final,
     session_busy,
     split_message,
@@ -65,6 +67,7 @@ class BridgeService:
         self.thread_choices: Dict[int, str] = {}
         self.stop_event = threading.Event()
         self._stop_started = threading.Event()
+        self._online_notice_sent = threading.Event()
         self.worker_busy = threading.Event()
         self.worker = threading.Thread(target=self._worker_loop, name="codex-worker", daemon=True)
         self.gateway = QQGatewayClient(
@@ -204,8 +207,14 @@ class BridgeService:
                 print(f"[qq-image] {path.name}: {exc}", flush=True)
 
     def _on_gateway_ready(self) -> None:
+        log_event("bridge", "QQ Gateway is ready")
+        if not self.config.qq_notify_on_ready:
+            return
         openid = self._current_openid()
         if openid:
+            if self._online_notice_sent.is_set():
+                return
+            self._online_notice_sent.set()
             active = self.active_thread.snapshot()
             self._safe_send(
                 openid,
@@ -214,7 +223,7 @@ class BridgeService:
                 keyboard=self._main_keyboard(),
             )
         else:
-            print("[bridge] waiting for /bind <code>", flush=True)
+            log_event("bridge", "waiting for /bind <code>")
 
     def _bind(self, event: Dict[str, Any]) -> None:
         content = event["content"]
@@ -606,10 +615,16 @@ class BridgeService:
         )
 
     def _refresh_desktop(self, thread_id: str) -> None:
-        if self.desktop_refresher.refresh(thread_id):
-            print(f"[desktop] refreshed thread={thread_id}", flush=True)
-        elif self.config.codex_desktop_refresh:
-            print(f"[desktop] refresh failed thread={thread_id}", flush=True)
+        try:
+            if self.desktop_refresher.refresh(thread_id):
+                log_event("desktop", f"refreshed thread={thread_id}")
+            elif self.config.codex_desktop_refresh:
+                log_event("desktop", f"refresh skipped or failed thread={thread_id}")
+        except Exception:
+            log_event(
+                "desktop",
+                f"refresh raised thread={thread_id}\n{traceback.format_exc()}",
+            )
 
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -618,12 +633,20 @@ class BridgeService:
             except queue.Empty:
                 continue
             self.worker_busy.set()
+            stage = "prepare"
             try:
                 action = event.get("action", "resume")
                 target_thread_id = event.get("thread_id") or self.active_thread.snapshot().thread_id
+                log_event(
+                    "worker",
+                    f"started action={action} thread={target_thread_id}",
+                )
+                stage = "wait-for-idle"
                 if not self._wait_until_idle(target_thread_id):
                     self._safe_send(event["openid"], "等待当前任务结束超时，本条消息未执行。")
+                    log_event("worker", f"timed out stage={stage} thread={target_thread_id}")
                     continue
+                stage = "prepare-input"
                 workdir = Path(event.get("workdir") or str(self.config.codex_workdir))
                 attachments = event.get("attachments") or []
                 prompt = str(event.get("content") or "").strip()
@@ -632,6 +655,7 @@ class BridgeService:
                 temp_parent = self.config.base_dir / "data"
                 temp_parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(prefix="qq-images-", dir=temp_parent) as raw_dir:
+                    stage = "download-attachments"
                     image_paths = download_c2c_images(
                         attachments,
                         Path(raw_dir),
@@ -642,6 +666,7 @@ class BridgeService:
                         raise ValueError("消息中没有可处理的图片")
                     refreshed_thread_id = target_thread_id
                     try:
+                        stage = "run-codex"
                         refreshed_thread_id = self._run_job(
                             event,
                             action,
@@ -650,13 +675,33 @@ class BridgeService:
                             prompt,
                             image_paths,
                         )
-                    finally:
+                    except Exception:
                         if action == "new":
                             refreshed_thread_id = self.active_thread.snapshot().thread_id
                         self._mark_thread_idle(refreshed_thread_id)
                         self._refresh_desktop(refreshed_thread_id)
+                        raise
+                    stage = "finalize"
+                    if action == "new":
+                        refreshed_thread_id = self.active_thread.snapshot().thread_id
+                    self._mark_thread_idle(refreshed_thread_id)
+                    self._refresh_desktop(refreshed_thread_id)
+                log_event(
+                    "worker",
+                    f"completed action={action} thread={refreshed_thread_id}",
+                )
             except Exception as exc:
-                self._safe_send(event["openid"], f"Codex 任务启动失败：{exc}")
+                log_event(
+                    "worker",
+                    f"failed stage={stage}\n{traceback.format_exc()}",
+                )
+                workdir = Path(event.get("workdir") or str(self.config.codex_workdir))
+                detail = summarize_codex_error(str(exc), max_chars=400)
+                safe_detail, _images = qq_safe_final(detail, workdir, max_images=0)
+                self._safe_send(
+                    event["openid"],
+                    f"Codex 任务处理失败（阶段：{stage}）：\n{safe_detail}",
+                )
             finally:
                 self.worker_busy.clear()
                 self.jobs.task_done()
@@ -672,10 +717,9 @@ class BridgeService:
     ) -> str:
         result_thread_id = target_thread_id
         if action == "new":
-            print(
-                f"[codex] new cwd={workdir} chars={len(prompt)} "
-                f"images={len(image_paths)}",
-                flush=True,
+            log_event(
+                "codex",
+                f"new cwd={workdir} chars={len(prompt)} images={len(image_paths)}",
             )
             code, new_thread_id, final, stderr = self.runner.run_new(
                 prompt, workdir, image_paths
@@ -696,10 +740,10 @@ class BridgeService:
                     "任务已执行，但没有解析到新任务编号，因此未切换当前任务。",
                 )
         else:
-            print(
-                f"[codex] resume thread={target_thread_id} chars={len(prompt)} "
+            log_event(
+                "codex",
+                f"resume thread={target_thread_id} chars={len(prompt)} "
                 f"images={len(image_paths)}",
-                flush=True,
             )
             code, final, stderr = self.runner.run(
                 prompt, target_thread_id, workdir, image_paths
@@ -768,7 +812,7 @@ def check_installation(config: Config) -> int:
     if websocket is None:
         errors.append("缺少 Python 依赖 websocket-client")
     try:
-        version = subprocess.run(
+        completed = subprocess.run(
             [*config.codex_command, "--version"],
             cwd=str(config.codex_workdir),
             stdout=subprocess.PIPE,
@@ -776,7 +820,8 @@ def check_installation(config: Config) -> int:
             text=True,
             timeout=10,
             check=False,
-        ).stdout.strip()
+        )
+        version = (completed.stdout or "").strip() or "unknown"
     except Exception as exc:
         errors.append(f"Codex 命令检查失败: {exc}")
         version = "unknown"
@@ -817,9 +862,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_service)
     signal.signal(signal.SIGTERM, stop_service)
     active = service.active_thread.snapshot()
-    print(
-        f"Codex Chat Bridge starting thread={active.thread_id} cwd={active.workdir}",
-        flush=True,
+    log_event(
+        "bridge",
+        f"starting thread={active.thread_id} cwd={active.workdir}",
     )
     service.run()
     return 0

@@ -11,14 +11,15 @@
 - QQ 回复优先使用 Markdown 卡片和快捷按钮，失败时自动回退到纯文本。
 - QQ 图片可作为图片输入交给 Codex；Codex 明确返回的安全本地图片可上传回 QQ。
 - 普通任务开始时会显示 QQ“正在输入”状态。
-- QQ 发起的回合结束后，通过仅监听本机的 Chrome DevTools Protocol 按 Thread UUID
-  选择目标任务并重载渲染页，使 Desktop 重新读取最新历史；不会重启 Codex 主进程或
-  app-server，也不修改 Codex 数据库。
+- 在启用 Desktop 刷新时，QQ 发起的回合结束后通过仅监听本机的 Chrome DevTools
+  Protocol 按 Thread UUID 选择目标任务并重载渲染页，使 Desktop 重新读取最新历史；
+  不会重启 Codex 主进程或 app-server，也不修改 Codex 数据库。
 - 当前任务执行中收到的新消息会排队，避免同时写入同一个会话。
 - 首次使用一次性绑定码，绑定后只接受该 QQ `openid`。
 
-> 当前实际可用渠道仅为 QQ，运行环境以 macOS Codex Desktop 为主。项目名称使用
-> `codex-chat-bridge`，为后续增加其他聊天渠道和管理界面保留空间。
+> 当前实际可用渠道仅为 QQ。macOS 已完成端到端验证；Windows 已加入核心桥接兼容实现，
+> 但尚未经过 Windows 真机端到端验证。项目名称使用 `codex-chat-bridge`，为后续增加
+> 其他聊天渠道和管理界面保留空间。
 
 ## 演进方向
 
@@ -28,17 +29,24 @@
 
 ## 当前实现边界
 
-本实现已在 Codex CLI `0.146.0-alpha.3.1` 上验证按 UUID 续接会话，桌面任务保存在
-`~/.codex/sessions` 原生会话文件中。其他版本可能存在兼容性差异。Codex Desktop 的
-内部 Socket 不是可直接复用的公开 app-server control socket，因此本版本使用
-“监听会话文件 + CLI resume”。
+本实现已在 macOS 与 Codex CLI `0.146.0-alpha.3.1` 上验证按 UUID 续接会话，桌面任务
+保存在 `~/.codex/sessions` 原生会话文件中。其他系统和版本可能存在兼容性差异。
+Windows 的配置、命令路径、PowerShell 启动和核心桥接路径已有兼容处理，但目前没有
+Windows 真机验证结论。Codex Desktop 的内部 Socket 不是可直接复用的公开 app-server
+control socket，因此本版本使用“监听会话文件 + CLI resume”。
 
-QQ 回复会写入所选任务的原生会话。Codex Desktop 不会订阅外部 CLI 连接的回合事件，
-所以桥接器默认在 QQ 回合结束后连接 `127.0.0.1:9229`，按 UUID 点击侧栏任务并执行
-一次 renderer reload。该操作会让页面闪烁，并可能清除 Desktop 输入框中尚未发送的
-草稿；可用 `CODEX_DESKTOP_REFRESH=0` 关闭。找不到目标侧栏行或调试端口不可用时会
-安全跳过，不会刷新其他任务。桥接器不会接管 Codex Desktop 原生命令级审批；需要
-人工批准的操作仍可能在桌面端等待。不要为方便而启用绕过沙箱的参数。
+QQ 回复会写入所选任务的原生会话。Codex Desktop 不会订阅外部 CLI 连接的回合事件。
+macOS 默认在 QQ 回合结束后连接 `127.0.0.1:9229`，按 UUID 点击侧栏任务并执行一次
+renderer reload；Windows 的 Desktop 刷新尚未验证，因此默认关闭。该操作会让页面
+闪烁，并可能清除 Desktop 输入框中尚未发送的草稿。可通过
+`CODEX_DESKTOP_REFRESH=0` 或 `1` 显式关闭或开启；Windows 开启前需自行确认 Desktop
+调试端口可用。找不到目标侧栏行或调试端口不可用时会安全跳过，不会刷新其他任务。
+桥接器不会接管 Codex Desktop 原生命令级审批；需要人工批准的操作仍可能在桌面端
+等待。不要为方便而启用绕过沙箱的参数。
+
+QQ Gateway 建立 READY 会话时的“Bridge 已上线”消息默认关闭，避免网络重连产生重复
+通知。如需启动提醒，将 `.env` 中的 `QQ_NOTIFY_ON_READY` 设为 `1`；同一 Bridge 进程
+即使重连多次也只发送一次。
 
 全部任务通知使用 Codex 只读任务索引取得可见根任务，并为每个 rollout 文件保存独立
 字节游标。首次启用时只建立当前文件尾部基线，不补发历史；之后桥接短暂重启期间新增
@@ -51,9 +59,12 @@ QQ 回复会写入所选任务的原生会话。Codex Desktop 不会订阅外部
 
 ## 前置条件
 
-1. Mac 保持开机、联网且不进入睡眠。
-2. Codex CLI 已登录；当前环境已经安装并可找到 `codex`。
-3. 如需 Desktop 自动同步，完全退出 Codex 后使用以下本机调试参数启动一次：
+1. 运行桥接器的 Mac 或 Windows 电脑保持开机、联网且不进入睡眠。
+2. 已安装 Python 3 和 Codex CLI，且 Codex CLI 已登录并可通过 `codex` 命令启动。
+3. 已在 [QQ 开放平台](https://bot.q.qq.com/) 创建机器人，取得 AppID 和 AppSecret，
+   并开通 C2C 私聊消息事件。
+
+macOS 如需 Desktop 自动同步，完全退出 Codex 后使用以下本机调试参数启动一次：
 
 ```bash
 /usr/bin/open -a /Applications/ChatGPT.app --args \
@@ -61,10 +72,9 @@ QQ 回复会写入所选任务的原生会话。Codex Desktop 不会订阅外部
   --remote-allow-origins=http://127.0.0.1:9229
 ```
 
-4. 在 [QQ 开放平台](https://bot.q.qq.com/) 创建机器人，取得 AppID 和 AppSecret，
-   并开通 C2C 私聊消息事件。
-
 ## 安装
+
+### macOS
 
 ```bash
 git clone https://github.com/GiaoZhao/codex-chat-bridge.git
@@ -86,6 +96,22 @@ AppSecret 输入框会隐藏内容，值不会出现在命令行或程序输出�
 `scripts/run.sh` 默认通过 macOS `caffeinate -i` 在桥接器运行期间阻止空闲睡眠，但允许
 正常锁屏。临时关闭这一行为可使用 `CODEX_QQ_KEEP_AWAKE=0 ./scripts/run.sh`。
 
+### Windows PowerShell
+
+```powershell
+git clone https://github.com/GiaoZhao/codex-chat-bridge.git
+Set-Location codex-chat-bridge
+.\scripts\setup.ps1
+.\.venv\Scripts\python.exe configure.py
+.\scripts\run.ps1 --check
+.\scripts\run.ps1
+```
+
+Windows 配置器使用终端输入，不支持 `configure.py --gui`。配置器在 macOS 写入
+`CODEX_DESKTOP_REFRESH=1`，在 Windows 和其他平台写入 `0`；可随后在 `.env` 中显式
+调整。Windows 核心桥接兼容实现尚未经过真机端到端验证，建议先执行 `--check`，确认
+Codex 命令、任务索引和会话文件均可读取后再启动。
+
 `configure.py` 会要求输入 QQ AppID、AppSecret、一个初始 Codex Thread UUID，以及该
 任务的工作目录。若不知道 Thread UUID，可在终端列出最近的本地根任务：
 
@@ -106,8 +132,9 @@ sqlite3 -header -column ~/.codex/state_5.sqlite \
 /bind 你的八位绑定码
 ```
 
-绑定信息保存在 `data/state.json`，AppSecret 保存在权限为 `0600` 的 `.env`；二者均被
-`.gitignore` 排除。
+绑定信息保存在 `data/state.json`，AppSecret 保存在 `.env`；二者均被 `.gitignore`
+排除。配置器在支持 POSIX 权限的平台将 `.env` 设为 `0600`；Windows 还应确保项目目录
+只允许当前用户访问。
 
 ## QQ 命令
 
@@ -138,9 +165,18 @@ QQ 入站图片仅接受 HTTPS 图片附件，默认每张最大 20MB、每条�
 
 ## 本地验证
 
+macOS：
+
 ```bash
 ./.venv/bin/python -m unittest discover -s tests -v
 ./scripts/run.sh --check
+```
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\scripts\run.ps1 --check
 ```
 
 `--check` 只检查本机配置、依赖、Codex 命令和会话文件，不连接 QQ。真正启动时才会用
@@ -159,4 +195,4 @@ AppID/AppSecret 获取 QQ token 并连接官方 WebSocket Gateway。
 
 QQ Gateway 的请求路径和事件结构参考了 QQ 官方机器人 API，以及公开项目
 [G-Photon/codex-remote-bridge](https://github.com/G-Photon/codex-remote-bridge) 的协议实践；
-本实现为面向当前 macOS Codex Desktop 任务的独立最小实现。
+本实现为面向本机 Codex Desktop 任务的独立最小实现。

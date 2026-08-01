@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -25,6 +26,11 @@ THREAD_ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def log_event(component: str, message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{component}] {message}", flush=True)
 
 
 def load_env(path: Path) -> None:
@@ -57,6 +63,44 @@ def env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def parse_command(value: str, windows: Optional[bool] = None) -> Tuple[str, ...]:
+    raw = value.strip()
+    if not raw:
+        return ()
+    use_windows_rules = os.name == "nt" if windows is None else windows
+    if not use_windows_rules:
+        return tuple(shlex.split(raw))
+
+    unquoted = (
+        raw[1:-1]
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}
+        else raw
+    )
+    expanded = Path(ntpath.expandvars(unquoted)).expanduser()
+    if expanded.is_file():
+        return (str(expanded),)
+
+    parts = shlex.split(raw, posix=False)
+    normalized = tuple(
+        part[1:-1]
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {"'", '"'}
+        else part
+        for part in parts
+    )
+    if not normalized:
+        return ()
+    return (ntpath.expandvars(normalized[0]), *normalized[1:])
+
+
+def resolve_command(command: Tuple[str, ...]) -> Tuple[str, ...]:
+    if not command:
+        return ()
+    executable = shutil.which(command[0])
+    if not executable:
+        return command
+    return (executable, *command[1:])
+
+
 @dataclass(frozen=True)
 class Config:
     base_dir: Path
@@ -71,6 +115,7 @@ class Config:
     qq_reply_chunks: int
     qq_attachment_max_bytes: int
     qq_attachment_max_images: int
+    qq_notify_on_ready: bool
     codex_desktop_refresh: bool
     codex_desktop_cdp_url: str
     codex_desktop_refresh_delay_ms: int
@@ -96,7 +141,7 @@ class Config:
             os.getenv("CODEX_STATE_DB", str(Path.home() / ".codex" / "state_5.sqlite"))
         ).expanduser()
         command_raw = os.getenv("CODEX_COMMAND", "codex").strip() or "codex"
-        command = tuple(shlex.split(command_raw))
+        command = resolve_command(parse_command(command_raw))
         desktop_cdp_url = os.getenv(
             "CODEX_DESKTOP_CDP_URL", "http://127.0.0.1:9229"
         ).strip().rstrip("/")
@@ -116,10 +161,8 @@ class Config:
             errors.append(f"CODEX_STATE_DB 不存在: {state_db}")
         if not command:
             errors.append("CODEX_COMMAND 不能为空")
-        elif "/" not in command[0] and shutil.which(command[0]) is None:
+        elif shutil.which(command[0]) is None and not Path(command[0]).expanduser().is_file():
             errors.append(f"找不到 Codex 命令: {command[0]}")
-        elif "/" in command[0] and not Path(command[0]).expanduser().exists():
-            errors.append(f"Codex 命令不存在: {command[0]}")
         parsed_cdp_url = urlparse(desktop_cdp_url)
         if (
             parsed_cdp_url.scheme != "http"
@@ -148,7 +191,8 @@ class Config:
                 "QQ_ATTACHMENT_MAX_BYTES", 20 * 1024 * 1024, 1024, 20 * 1024 * 1024
             ),
             qq_attachment_max_images=env_int("QQ_ATTACHMENT_MAX_IMAGES", 3, 1, 5),
-            codex_desktop_refresh=env_bool("CODEX_DESKTOP_REFRESH", True),
+            qq_notify_on_ready=env_bool("QQ_NOTIFY_ON_READY", False),
+            codex_desktop_refresh=env_bool("CODEX_DESKTOP_REFRESH", os.name != "nt"),
             codex_desktop_cdp_url=desktop_cdp_url,
             codex_desktop_refresh_delay_ms=env_int(
                 "CODEX_DESKTOP_REFRESH_DELAY_MS", 800, 100, 5000
@@ -715,13 +759,18 @@ class CodexRunner:
             process.terminate()
             return True
 
-    def _execute(self, command: List[str], workdir: Path) -> Tuple[int, str, str]:
+    def _execute(
+        self,
+        command: List[str],
+        workdir: Path,
+        stdin_text: Optional[str] = None,
+    ) -> Tuple[int, str, str]:
         if not workdir.is_dir():
             raise ValueError(f"任务工作目录不存在: {workdir}")
         process = subprocess.Popen(
             command,
             cwd=str(workdir),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -730,7 +779,15 @@ class CodexRunner:
             self._process = process
         try:
             try:
-                stdout, stderr = process.communicate(timeout=self.config.codex_turn_timeout)
+                if stdin_text is None:
+                    stdout, stderr = process.communicate(
+                        timeout=self.config.codex_turn_timeout
+                    )
+                else:
+                    stdout, stderr = process.communicate(
+                        input=stdin_text,
+                        timeout=self.config.codex_turn_timeout,
+                    )
             except subprocess.TimeoutExpired:
                 process.terminate()
                 try:
@@ -738,8 +795,13 @@ class CodexRunner:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     stdout, stderr = process.communicate()
-                stderr = f"任务超过 {self.config.codex_turn_timeout} 秒，已终止。\n{stderr}"
-            return process.returncode or 0, stdout, stderr.strip()
+                stderr = (
+                    f"任务超过 {self.config.codex_turn_timeout} 秒，已终止。\n"
+                    f"{stderr or ''}"
+                )
+            stdout_text = stdout or ""
+            stderr_text = stderr or ""
+            return process.returncode or 0, stdout_text, stderr_text.strip()
         finally:
             with self._lock:
                 self._process = None
@@ -761,9 +823,9 @@ class CodexRunner:
             "--json",
             *self._image_args(image_paths),
             selected_thread_id,
-            prompt,
+            "-",
         ]
-        code, stdout, stderr = self._execute(command, selected_workdir)
+        code, stdout, stderr = self._execute(command, selected_workdir, prompt)
         return code, extract_final_from_codex_jsonl(stdout), stderr
 
     def run_new(
@@ -775,9 +837,9 @@ class CodexRunner:
             "--skip-git-repo-check",
             "--json",
             *self._image_args(image_paths),
-            prompt,
+            "-",
         ]
-        code, stdout, stderr = self._execute(command, workdir)
+        code, stdout, stderr = self._execute(command, workdir, prompt)
         return (
             code,
             extract_thread_id_from_codex_jsonl(stdout),
@@ -915,6 +977,16 @@ def split_message(text: str, max_chars: int, max_chunks: int) -> List[str]:
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 LOCAL_PATH_RE = re.compile(r"(?<![\w:])/(?:Users|private|var|tmp)/[^\s)\]}>]+")
+WINDOWS_QUOTED_LOCAL_PATH_RE = re.compile(
+    r'''(?ix)(?:
+        "(?:[a-z]:[\\/]|\\\\)[^"\r\n]+"
+        | '(?:[a-z]:[\\/]|\\\\)[^'\r\n]+'
+        | <(?:[a-z]:[\\/]|\\\\)[^>\r\n]+>
+    )'''
+)
+WINDOWS_LOCAL_PATH_RE = re.compile(
+    r'''(?ix)(?<![\w])(?:[a-z]:[\\/]|\\\\)[^\r\n)\]}>,'"，。；;]+'''
+)
 QQ_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 
@@ -966,4 +1038,6 @@ def qq_safe_final(
 
     text = MARKDOWN_IMAGE_RE.sub(replace_image, message)
     text = LOCAL_PATH_RE.sub("[本地路径已隐藏]", text)
+    text = WINDOWS_QUOTED_LOCAL_PATH_RE.sub("[本地路径已隐藏]", text)
+    text = WINDOWS_LOCAL_PATH_RE.sub("[本地路径已隐藏]", text)
     return text.strip(), images

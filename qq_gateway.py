@@ -4,6 +4,7 @@ import html
 import hashlib
 import json
 import mimetypes
+import platform
 import re
 import threading
 import time
@@ -13,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-from bridge_core import Config
+from bridge_core import Config, log_event
 
 try:
     import websocket
@@ -21,7 +22,8 @@ except ImportError:
     websocket = None
 
 
-USER_AGENT = "CodexChatBridge/0.1 macOS"
+PLATFORM_NAME = platform.system().strip().lower() or "unknown"
+USER_AGENT = f"CodexChatBridge/0.1 ({PLATFORM_NAME})"
 
 
 def http_json(
@@ -408,7 +410,7 @@ class QQGatewayClient:
         while not self.stop_event.is_set():
             try:
                 url = self.api.gateway_url()
-                print(f"[qq-gateway] connecting {url}", flush=True)
+                log_event("qq-gateway", f"connecting {url}")
                 self.ws = websocket.WebSocketApp(
                     url,
                     on_message=self._on_message,
@@ -417,9 +419,9 @@ class QQGatewayClient:
                 )
                 self.ws.run_forever(ping_interval=0)
             except Exception as exc:
-                print(f"[qq-gateway] {exc}", flush=True)
+                log_event("qq-gateway", str(exc))
             if not self.stop_event.wait(5):
-                print("[qq-gateway] reconnecting", flush=True)
+                log_event("qq-gateway", "reconnecting")
 
     def _send(self, payload: Dict[str, Any]) -> None:
         with self._send_lock:
@@ -436,7 +438,7 @@ class QQGatewayClient:
                     "intents": self.config.qq_intents,
                     "shard": [0, 1],
                     "properties": {
-                        "$os": "macos",
+                        "$os": PLATFORM_NAME,
                         "$browser": "codex-chat-bridge",
                         "$device": "codex-chat-bridge",
                     },
@@ -455,7 +457,7 @@ class QQGatewayClient:
                 try:
                     self._send({"op": 1, "d": self.latest_seq})
                 except Exception as exc:
-                    print(f"[qq-heartbeat] {exc}", flush=True)
+                    log_event("qq-heartbeat", str(exc))
                     return
 
         threading.Thread(target=loop, name="qq-heartbeat", daemon=True).start()
@@ -500,18 +502,18 @@ class QQGatewayClient:
             if event_type == "READY":
                 data = payload.get("d") or {}
                 self.session_id = str(data.get("session_id") or "")
-                print(f"[qq-gateway] READY session={self.session_id[:8]}", flush=True)
+                log_event("qq-gateway", f"READY session={self.session_id[:8]}")
                 self.on_ready()
                 return
             event = extract_c2c_event(payload)
             if event and self._dedup(event["message_id"]):
                 self.on_event(event)
         except Exception as exc:
-            print(f"[qq-gateway] event error: {exc}", flush=True)
+            log_event("qq-gateway", f"event error: {exc}")
 
     def _on_error(self, _ws: Any, error: Any) -> None:
-        print(f"[qq-gateway] websocket error: {error}", flush=True)
+        log_event("qq-gateway", f"websocket error: {error}")
 
     def _on_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self._stop_heartbeat()
-        print(f"[qq-gateway] closed code={code} reason={reason}", flush=True)
+        log_event("qq-gateway", f"closed code={code} reason={reason}")

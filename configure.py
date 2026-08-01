@@ -7,6 +7,7 @@ import os
 import secrets
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -61,6 +62,9 @@ def main() -> int:
     )
     parser.add_argument("--gui", action="store_true", help="use secure macOS dialogs")
     args = parser.parse_args()
+    if args.gui and sys.platform != "darwin":
+        print("配置错误：--gui 仅支持 macOS；请移除 --gui 使用终端配置。", file=sys.stderr)
+        return 2
     env_path = BASE_DIR / ".env"
     if env_path.exists():
         if args.gui:
@@ -86,16 +90,18 @@ def main() -> int:
     )
     command = shutil.which("codex") or "codex"
     bind_code = "".join(secrets.choice("0123456789") for _ in range(8))
+    desktop_refresh = "1" if sys.platform == "darwin" else "0"
 
     values = {
         "QQ_APP_ID": app_id,
         "QQ_APP_SECRET": app_secret,
         "QQ_BIND_CODE": bind_code,
         "QQ_ALLOWED_OPENID": "",
+        "QQ_NOTIFY_ON_READY": "0",
         "CODEX_THREAD_ID": thread_id,
         "CODEX_WORKDIR": workdir,
         "CODEX_COMMAND": command,
-        "CODEX_DESKTOP_REFRESH": "1",
+        "CODEX_DESKTOP_REFRESH": desktop_refresh,
         "QQ_REPLY_MAX_CHARS": "1500",
         "QQ_REPLY_MAX_CHUNKS": "8",
         "QQ_ATTACHMENT_MAX_BYTES": "20971520",

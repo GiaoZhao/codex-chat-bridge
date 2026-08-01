@@ -517,9 +517,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((code, created_id, final, error), (0, thread_id, "created", ""))
             self.assertEqual(
                 execute.call_args.args[0],
-                ["codex", "exec", "--skip-git-repo-check", "--json", "first prompt"],
+                ["codex", "exec", "--skip-git-repo-check", "--json", "-"],
             )
             self.assertEqual(execute.call_args.args[1], root)
+            self.assertEqual(execute.call_args.args[2], "first prompt")
 
     def test_resume_passes_each_image_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -548,9 +549,10 @@ class RunnerTests(unittest.TestCase):
                     "-i",
                     str(second),
                     config.codex_thread_id,
-                    "inspect",
+                    "-",
                 ],
             )
+            self.assertEqual(execute.call_args.args[2], "inspect")
 
     def test_qq_safe_final_extracts_allowed_image_and_redacts_paths(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
