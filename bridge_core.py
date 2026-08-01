@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import ntpath
+import nturl2path
 import os
 import re
 import shlex
@@ -774,6 +775,8 @@ class CodexRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         with self._lock:
             self._process = process
@@ -977,6 +980,7 @@ def split_message(text: str, max_chars: int, max_chunks: int) -> List[str]:
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")
 LOCAL_PATH_RE = re.compile(r"(?<![\w:])/(?:Users|private|var|tmp)/[^\s)\]}>]+")
+WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)^(?:[a-z]:[\\/]|\\\\)")
 WINDOWS_QUOTED_LOCAL_PATH_RE = re.compile(
     r'''(?ix)(?:
         "(?:[a-z]:[\\/]|\\\\)[^"\r\n]+"
@@ -998,6 +1002,31 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _local_path_from_target(
+    raw_target: str,
+    windows: Optional[bool] = None,
+) -> Optional[str]:
+    use_windows_rules = os.name == "nt" if windows is None else windows
+    if use_windows_rules and WINDOWS_ABSOLUTE_PATH_RE.match(raw_target):
+        return unquote(raw_target)
+
+    parsed = urlparse(raw_target)
+    if parsed.scheme not in {"", "file"}:
+        return None
+    if parsed.scheme != "file":
+        return unquote(raw_target)
+    if not use_windows_rules:
+        return unquote(parsed.path)
+
+    url_path = parsed.path
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        url_path = f"//{parsed.netloc}{parsed.path}"
+    try:
+        return nturl2path.url2pathname(url_path)
+    except OSError:
+        return None
+
+
 def qq_safe_final(
     message: str,
     workdir: Path,
@@ -1015,10 +1044,9 @@ def qq_safe_final(
 
     def replace_image(match: re.Match[str]) -> str:
         raw_target = match.group(1).strip("<>")
-        parsed = urlparse(raw_target)
-        if parsed.scheme not in {"", "file"}:
+        raw_path = _local_path_from_target(raw_target)
+        if raw_path is None:
             return match.group(0)
-        raw_path = unquote(parsed.path if parsed.scheme == "file" else raw_target)
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             candidate = (roots[0] / candidate).resolve()

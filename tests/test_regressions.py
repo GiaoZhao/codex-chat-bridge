@@ -12,6 +12,7 @@ from bridge import BridgeService
 from bridge_core import (
     CodexRunner,
     ThreadInfo,
+    _local_path_from_target,
     parse_command,
     qq_safe_final,
     resolve_command,
@@ -84,6 +85,8 @@ class RunnerRegressionTests(unittest.TestCase):
 
         self.assertEqual(result, (0, "", ""))
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+        self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["errors"], "replace")
         process.communicate.assert_called_once_with(input=prompt, timeout=60)
 
 
@@ -166,6 +169,34 @@ class RedactionRegressionTests(unittest.TestCase):
         self.assertNotIn("Alice Smith", text)
         self.assertNotIn("Private Share", text)
         self.assertEqual(text.count("[本地路径已隐藏]"), 5)
+
+
+class WindowsImagePathRegressionTests(unittest.TestCase):
+    def test_windows_drive_path_is_treated_as_local(self) -> None:
+        target = r"C:\Users\alice\Codex\result.png"
+
+        self.assertEqual(_local_path_from_target(target, windows=True), target)
+
+    def test_windows_file_url_is_converted_to_drive_path(self) -> None:
+        target = "file:///C:/Program%20Files/Codex/result.png"
+
+        self.assertEqual(
+            _local_path_from_target(target, windows=True),
+            r"C:\Program Files\Codex\result.png",
+        )
+
+    def test_windows_unc_file_url_is_converted_to_unc_path(self) -> None:
+        target = "file://server/Private%20Share/result.png"
+
+        self.assertEqual(
+            _local_path_from_target(target, windows=True),
+            r"\\server\Private Share\result.png",
+        )
+
+    def test_malformed_windows_file_url_is_rejected(self) -> None:
+        target = "file:///C:/Codex/result:invalid.png"
+
+        self.assertIsNone(_local_path_from_target(target, windows=True))
 
 
 class GatewayPlatformRegressionTests(unittest.TestCase):
