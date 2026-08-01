@@ -113,7 +113,9 @@ Windows 配置器使用终端输入，不支持 `configure.py --gui`。配置器
 Codex 命令、任务索引和会话文件均可读取后再启动。
 
 `configure.py` 会要求输入 QQ AppID、AppSecret、一个初始 Codex Thread UUID，以及该
-任务的工作目录。若不知道 Thread UUID，可在终端列出最近的本地根任务：
+任务的工作目录。若不知道 Thread UUID，可在终端列出最近的本地根任务。
+
+macOS：
 
 ```bash
 sqlite3 -header -column ~/.codex/state_5.sqlite \
@@ -121,6 +123,26 @@ sqlite3 -header -column ~/.codex/state_5.sqlite \
    FROM threads \
    WHERE archived = 0 AND preview <> '' AND source NOT LIKE '%subagent%' \
    ORDER BY updated_at DESC LIMIT 10;"
+```
+
+Windows PowerShell（使用 Python 标准库，不要求额外安装 `sqlite3` 命令）：
+
+```powershell
+@'
+import sqlite3
+from pathlib import Path
+
+database = Path.home() / ".codex" / "state_5.sqlite"
+query = """
+SELECT id, cwd, substr(replace(preview, char(10), ' '), 1, 60) AS preview
+FROM threads
+WHERE archived = 0 AND preview <> '' AND source NOT LIKE '%subagent%'
+ORDER BY updated_at DESC LIMIT 10
+"""
+with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
+    for row in connection.execute(query):
+        print(" | ".join(str(value) for value in row))
+'@ | .\.venv\Scripts\python.exe -
 ```
 
 复制目标任务的 `id` 和 `cwd`，分别填入 Thread UUID 和工作目录。该查询只读，不会
