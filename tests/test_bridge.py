@@ -698,6 +698,9 @@ class BridgeServiceTests(unittest.TestCase):
     def test_first_stop_waits_and_second_stop_cancels(self) -> None:
         service = BridgeService.__new__(BridgeService)
         service._stop_started = threading.Event()
+        service._stop_complete = threading.Event()
+        service._stop_state_lock = threading.Lock()
+        service._components_stopped = False
         service.stop_event = threading.Event()
         service.runner = MockRunner()
         service.gateway = MockLifecycle()

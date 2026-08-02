@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import ntpath
 import nturl2path
 import os
@@ -29,9 +30,68 @@ THREAD_ID_RE = re.compile(
 )
 
 
-def log_event(component: str, message: str) -> None:
+_LOG_LOCK = threading.Lock()
+_LOG_PATH: Optional[Path] = None
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+_LOG_BACKUP_COUNT = 5
+
+
+def configure_log_file(
+    path: Path,
+    max_bytes: int = _LOG_MAX_BYTES,
+    backup_count: int = _LOG_BACKUP_COUNT,
+) -> None:
+    global _LOG_PATH, _LOG_MAX_BYTES, _LOG_BACKUP_COUNT
+    resolved = path.expanduser().resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(resolved.parent, 0o700)
+    except OSError:
+        pass
+    _LOG_PATH = resolved
+    _LOG_MAX_BYTES = max(64 * 1024, max_bytes)
+    _LOG_BACKUP_COUNT = max(1, backup_count)
+
+
+def _rotate_log(path: Path) -> None:
+    if not path.exists() or path.stat().st_size < _LOG_MAX_BYTES:
+        return
+    oldest = path.with_name(f"{path.name}.{_LOG_BACKUP_COUNT}")
+    if oldest.exists():
+        oldest.unlink()
+    for index in range(_LOG_BACKUP_COUNT - 1, 0, -1):
+        source = path.with_name(f"{path.name}.{index}")
+        if source.exists():
+            source.replace(path.with_name(f"{path.name}.{index + 1}"))
+    path.replace(path.with_name(f"{path.name}.1"))
+
+
+def log_event(component: str, message: str, level: str = "INFO") -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{component}] {message}", flush=True)
+    normalized_level = level.strip().upper() or "INFO"
+    print(f"[{timestamp}] [{normalized_level}] [{component}] {message}", flush=True)
+    path = _LOG_PATH
+    if path is None:
+        return
+    record = json.dumps(
+        {
+            "timestamp": timestamp,
+            "level": normalized_level,
+            "component": component,
+            "message": message,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    with _LOG_LOCK:
+        try:
+            _rotate_log(path)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(record + "\n")
+            os.chmod(path, 0o600)
+        except OSError:
+            # Logging must never terminate the Bridge; stdout remains available.
+            return
 
 
 def load_env(path: Path) -> None:
@@ -489,6 +549,13 @@ def latest_complete_turn(path: Path) -> Optional[Tuple[str, str]]:
     return latest
 
 
+def session_record_event_id(path: Path, offset: int, record: Dict[str, Any]) -> str:
+    encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    resolved_path = os.path.normcase(str(path.resolve()))
+    raw = f"{resolved_path}:{offset}:{encoded}".encode("utf-8", errors="replace")
+    return hashlib.sha256(raw).hexdigest()
+
+
 class SessionMonitor:
     def __init__(
         self,
@@ -498,6 +565,8 @@ class SessionMonitor:
         poll_seconds: float = 0.75,
         thread_provider: Optional[Callable[[], str]] = None,
         threads_provider: Optional[Callable[[], Iterable[ThreadInfo]]] = None,
+        on_final_event: Optional[Callable[[ThreadInfo, str, str], None]] = None,
+        on_interrupted: Optional[Callable[[ThreadInfo, str, str], None]] = None,
     ) -> None:
         self.config = config
         self.state = state
@@ -505,6 +574,8 @@ class SessionMonitor:
         self.poll_seconds = poll_seconds
         self.thread_provider = thread_provider or (lambda: self.config.codex_thread_id)
         self.threads_provider = threads_provider
+        self.on_final_event = on_final_event
+        self.on_interrupted = on_interrupted
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.path: Optional[Path] = None
@@ -537,7 +608,7 @@ class SessionMonitor:
     def stop(self) -> None:
         self.stop_event.set()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=3)
+            self.thread.join()
 
     def is_busy(self) -> bool:
         with self._status_lock:
@@ -623,20 +694,39 @@ class SessionMonitor:
             self._set_busy(session_busy(active_path) if active_path else False)
         return changed
 
-    def _handle_record(self, info: ThreadInfo, record: Dict[str, Any]) -> None:
+    @staticmethod
+    def _record_event_id(path: Path, offset: int, record: Dict[str, Any]) -> str:
+        return session_record_event_id(path, offset, record)
+
+    def _handle_record(
+        self,
+        info: ThreadInfo,
+        record: Dict[str, Any],
+        path: Path,
+        offset: int,
+    ) -> None:
         payload = record.get("payload") if record.get("type") == "event_msg" else None
+        event_id = self._record_event_id(path, offset, record)
         if isinstance(payload, dict) and info.thread_id == self.thread_provider():
             event_type = payload.get("type")
             if event_type == "task_started":
                 self._set_busy(True)
             elif event_type in {"task_complete", "turn_aborted", "turn_complete"}:
                 self._set_busy(False)
+        if (
+            isinstance(payload, dict)
+            and payload.get("type") == "turn_aborted"
+            and self.on_interrupted is not None
+        ):
+            raw_detail = payload.get("reason") or payload.get("message") or "Codex 任务已中断"
+            detail = str(raw_detail).strip()[:400] or "Codex 任务已中断"
+            self.on_interrupted(info, detail, event_id)
         message = final_message_from_record(record)
         if message:
-            try:
+            if self.on_final_event is not None:
+                self.on_final_event(info, message, event_id)
+            else:
                 self.on_final(info, message)
-            except Exception as exc:
-                print(f"[session-monitor] final callback: {exc}", flush=True)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -667,13 +757,20 @@ class SessionMonitor:
                             except (json.JSONDecodeError, UnicodeDecodeError):
                                 continue
                             if isinstance(record, dict):
-                                self._handle_record(self._infos[thread_id], record)
+                                self._handle_record(
+                                    self._infos[thread_id],
+                                    record,
+                                    path,
+                                    line_start,
+                                )
                         self._offsets[thread_id] = handle.tell()
                     changed = True
                 if changed:
                     self._persist_offsets()
             except (OSError, sqlite3.Error) as exc:
-                print(f"[session-monitor] {exc}", flush=True)
+                log_event("session-monitor", str(exc), level="ERROR")
+            except Exception as exc:
+                log_event("session-monitor", str(exc), level="ERROR")
             self.stop_event.wait(self.poll_seconds)
 
 
@@ -747,6 +844,7 @@ class CodexRunner:
         self.config = config
         self._lock = threading.Lock()
         self._process: Optional[subprocess.Popen[str]] = None
+        self._termination_reason = ""
 
     def running(self) -> bool:
         with self._lock:
@@ -757,14 +855,21 @@ class CodexRunner:
             process = self._process
             if not process or process.poll() is not None:
                 return False
+            self._termination_reason = "cancelled"
             process.terminate()
             return True
+
+    def termination_reason(self) -> str:
+        with self._lock:
+            return self._termination_reason
 
     def _execute(
         self,
         command: List[str],
         workdir: Path,
         stdin_text: Optional[str] = None,
+        on_started: Optional[Callable[[int], None]] = None,
+        on_diagnostic: Optional[Callable[[str], None]] = None,
     ) -> Tuple[int, str, str]:
         if not workdir.is_dir():
             raise ValueError(f"任务工作目录不存在: {workdir}")
@@ -780,28 +885,50 @@ class CodexRunner:
         )
         with self._lock:
             self._process = process
-        try:
+            self._termination_reason = ""
+        if on_started is not None:
             try:
-                if stdin_text is None:
-                    stdout, stderr = process.communicate(
-                        timeout=self.config.codex_turn_timeout
-                    )
-                else:
-                    stdout, stderr = process.communicate(
-                        input=stdin_text,
-                        timeout=self.config.codex_turn_timeout,
-                    )
-            except subprocess.TimeoutExpired:
-                process.terminate()
+                on_started(process.pid)
+            except Exception:
                 try:
-                    stdout, stderr = process.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                stderr = (
-                    f"任务超过 {self.config.codex_turn_timeout} 秒，已终止。\n"
-                    f"{stderr or ''}"
+                    process.terminate()
+                    process.communicate()
+                finally:
+                    with self._lock:
+                        self._process = None
+                raise
+        try:
+            if on_diagnostic is not None:
+                stdout, stderr = self._communicate_streaming(
+                    process,
+                    stdin_text,
+                    on_diagnostic,
                 )
+            else:
+                try:
+                    if stdin_text is None:
+                        stdout, stderr = process.communicate(
+                            timeout=self.config.codex_turn_timeout
+                        )
+                    else:
+                        stdout, stderr = process.communicate(
+                            input=stdin_text,
+                            timeout=self.config.codex_turn_timeout,
+                        )
+                except subprocess.TimeoutExpired:
+                    with self._lock:
+                        if not self._termination_reason:
+                            self._termination_reason = "timed_out"
+                    process.terminate()
+                    try:
+                        stdout, stderr = process.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    stderr = (
+                        f"任务超过 {self.config.codex_turn_timeout} 秒，已终止。\n"
+                        f"{stderr or ''}"
+                    )
             stdout_text = stdout or ""
             stderr_text = stderr or ""
             return process.returncode or 0, stdout_text, stderr_text.strip()
@@ -809,12 +936,83 @@ class CodexRunner:
             with self._lock:
                 self._process = None
 
+    def _communicate_streaming(
+        self,
+        process: subprocess.Popen[str],
+        stdin_text: Optional[str],
+        on_diagnostic: Callable[[str], None],
+    ) -> Tuple[str, str]:
+        stdout_parts: List[str] = []
+        stderr_parts: List[str] = []
+
+        def read_stream(stream: Any, target: List[str], diagnostic: bool) -> None:
+            if stream is None:
+                return
+            try:
+                for line in stream:
+                    target.append(line)
+                    if diagnostic and line.strip():
+                        try:
+                            on_diagnostic(line.strip())
+                        except Exception as exc:
+                            log_event(
+                                "codex-diagnostic",
+                                f"callback failed: {exc}",
+                                level="ERROR",
+                            )
+            except (OSError, ValueError) as exc:
+                log_event("codex-stream", str(exc), level="ERROR")
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=(process.stdout, stdout_parts, False),
+                name="codex-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=(process.stderr, stderr_parts, True),
+                name="codex-stderr",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+        if stdin_text is not None and process.stdin is not None:
+            try:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            except (BrokenPipeError, OSError) as exc:
+                stderr_parts.append(f"无法向 Codex 写入任务内容: {exc}\n")
+        try:
+            process.wait(timeout=self.config.codex_turn_timeout)
+        except subprocess.TimeoutExpired:
+            with self._lock:
+                if not self._termination_reason:
+                    self._termination_reason = "timed_out"
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            stderr_parts.insert(
+                0,
+                f"任务超过 {self.config.codex_turn_timeout} 秒，已终止。\n",
+            )
+        for reader in readers:
+            reader.join()
+        return "".join(stdout_parts), "".join(stderr_parts)
+
     def run(
         self,
         prompt: str,
         thread_id: Optional[str] = None,
         workdir: Optional[Path] = None,
         image_paths: Optional[List[Path]] = None,
+        on_started: Optional[Callable[[int], None]] = None,
+        on_diagnostic: Optional[Callable[[str], None]] = None,
     ) -> Tuple[int, Optional[str], str]:
         selected_thread_id = thread_id or self.config.codex_thread_id
         selected_workdir = workdir or self.config.codex_workdir
@@ -828,11 +1026,25 @@ class CodexRunner:
             selected_thread_id,
             "-",
         ]
-        code, stdout, stderr = self._execute(command, selected_workdir, prompt)
+        if on_started is None and on_diagnostic is None:
+            code, stdout, stderr = self._execute(command, selected_workdir, prompt)
+        else:
+            code, stdout, stderr = self._execute(
+                command,
+                selected_workdir,
+                prompt,
+                on_started=on_started,
+                on_diagnostic=on_diagnostic,
+            )
         return code, extract_final_from_codex_jsonl(stdout), stderr
 
     def run_new(
-        self, prompt: str, workdir: Path, image_paths: Optional[List[Path]] = None
+        self,
+        prompt: str,
+        workdir: Path,
+        image_paths: Optional[List[Path]] = None,
+        on_started: Optional[Callable[[int], None]] = None,
+        on_diagnostic: Optional[Callable[[str], None]] = None,
     ) -> Tuple[int, Optional[str], Optional[str], str]:
         command = [
             *self.config.codex_command,
@@ -842,7 +1054,16 @@ class CodexRunner:
             *self._image_args(image_paths),
             "-",
         ]
-        code, stdout, stderr = self._execute(command, workdir, prompt)
+        if on_started is None and on_diagnostic is None:
+            code, stdout, stderr = self._execute(command, workdir, prompt)
+        else:
+            code, stdout, stderr = self._execute(
+                command,
+                workdir,
+                prompt,
+                on_started=on_started,
+                on_diagnostic=on_diagnostic,
+            )
         return (
             code,
             extract_thread_id_from_codex_jsonl(stdout),

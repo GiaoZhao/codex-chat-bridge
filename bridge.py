@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
+import json
 import queue
 import signal
+import shutil
+import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from bridge_core import (
     ActiveThread,
@@ -23,14 +29,24 @@ from bridge_core import (
     StateStore,
     ThreadIndex,
     ThreadInfo,
+    configure_log_file,
     find_session_file,
+    final_message_from_record,
     latest_complete_turn,
     latest_final_message,
     log_event,
     qq_safe_final,
+    session_record_event_id,
     session_busy,
     split_message,
     summarize_codex_error,
+)
+from bridge_store import (
+    BridgeInstanceLock,
+    BridgeStore,
+    OutboxItem,
+    OutboxSpec,
+    StoredJob,
 )
 from qq_gateway import QQApi, QQGatewayClient, download_c2c_images, websocket
 
@@ -38,74 +54,264 @@ from qq_gateway import QQApi, QQGatewayClient, download_c2c_images, websocket
 BASE_DIR = Path(__file__).resolve().parent
 
 
+@dataclass(frozen=True)
+class JobRunResult:
+    thread_id: str
+    status: str
+    error: str = ""
+    notification: str = ""
+    final_message: str = ""
+    event_id: str = ""
+
+
+class JobDispatchUncertainError(RuntimeError):
+    pass
+
+
 class BridgeService:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.state = StateStore(config.base_dir / "data" / "state.json")
-        stored_state = self.state.load()
-        self.bound_openid = config.qq_allowed_openid or str(stored_state.get("bound_openid") or "")
-        if not self.bound_openid and not config.qq_bind_code:
-            raise ValueError("首次运行必须配置 QQ_BIND_CODE，或直接配置 QQ_ALLOWED_OPENID")
+        self.instance_lock = BridgeInstanceLock(config.base_dir / "data" / "bridge.lock")
+        try:
+            self.instance_lock.acquire()
+            self.state = StateStore(config.base_dir / "data" / "state.json")
+            self.store = BridgeStore(config.base_dir / "data" / "bridge.sqlite3")
+            stored_state = self.state.load()
+            self.bound_openid = config.qq_allowed_openid or str(
+                stored_state.get("bound_openid") or ""
+            )
+            if not self.bound_openid and not config.qq_bind_code:
+                raise ValueError("首次运行必须配置 QQ_BIND_CODE，或直接配置 QQ_ALLOWED_OPENID")
 
-        self.api = QQApi(config)
-        self.thread_index = ThreadIndex(config.codex_state_db)
-        self.active_thread = ActiveThread(config, self.state, self.thread_index)
-        self.runner = CodexRunner(config)
-        self.desktop_refresher = CodexDesktopRefresher(
-            config.codex_desktop_refresh,
-            config.codex_desktop_cdp_url,
-            config.codex_desktop_refresh_delay_ms / 1000,
-        )
-        self.monitor = SessionMonitor(
-            config,
-            self.state,
-            self._on_final,
-            thread_provider=lambda: self.active_thread.snapshot().thread_id,
-            threads_provider=self.thread_index.list_monitorable,
-        )
-        self.jobs: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=20)
-        self.thread_choices: Dict[int, str] = {}
-        self.stop_event = threading.Event()
-        self._stop_started = threading.Event()
-        self._online_notice_sent = threading.Event()
-        self.worker_busy = threading.Event()
-        self.worker = threading.Thread(target=self._worker_loop, name="codex-worker", daemon=True)
-        self.gateway = QQGatewayClient(
-            config,
-            self.api,
-            on_event=self._on_qq_event,
-            on_ready=self._on_gateway_ready,
-        )
-        self._send_lock = threading.Lock()
+            self.api = QQApi(config)
+            self.thread_index = ThreadIndex(config.codex_state_db)
+            self.active_thread = ActiveThread(config, self.state, self.thread_index)
+            self.runner = CodexRunner(config)
+            self.desktop_refresher = CodexDesktopRefresher(
+                config.codex_desktop_refresh,
+                config.codex_desktop_cdp_url,
+                config.codex_desktop_refresh_delay_ms / 1000,
+            )
+            self.monitor = SessionMonitor(
+                config,
+                self.state,
+                self._on_final,
+                thread_provider=lambda: self.active_thread.snapshot().thread_id,
+                threads_provider=self.thread_index.list_monitorable,
+                on_final_event=self._on_final_event,
+                on_interrupted=self._on_interrupted,
+            )
+            self.jobs: "queue.Queue[str]" = queue.Queue()
+            self.thread_choices: Dict[int, str] = {}
+            self.stop_event = threading.Event()
+            self._stop_started = threading.Event()
+            self._stop_complete = threading.Event()
+            self._stop_state_lock = threading.Lock()
+            self._components_stopped = False
+            self._fatal_shutdown_requested = threading.Event()
+            self._online_notice_sent = threading.Event()
+            self.worker_busy = threading.Event()
+            self.outbox_wakeup = threading.Event()
+            self.gateway_ready = threading.Event()
+            self._runtime_lock = threading.Lock()
+            self._outbox_image_lock = threading.RLock()
+            self.gateway_state = "stopped"
+            self.gateway_detail = ""
+            self.worker_stage = "idle"
+            self.current_job_id = ""
+            self.last_worker_error = ""
+            self.worker = threading.Thread(
+                target=self._worker_loop,
+                name="codex-worker",
+                daemon=True,
+            )
+            self.outbox_worker = threading.Thread(
+                target=self._outbox_loop,
+                name="qq-outbox",
+                daemon=True,
+            )
+            self.gateway = QQGatewayClient(
+                config,
+                self.api,
+                on_event=self._on_qq_event,
+                on_ready=self._on_gateway_ready,
+                on_state=self._on_gateway_state,
+            )
+            self._send_lock = threading.Lock()
+            recovered_leases = self.store.recover_outbox_leases()
+            self._cleanup_unreferenced_outbox_images()
+            self._restore_persisted_jobs()
+            if recovered_leases:
+                log_event("recovery", f"outbox_leases={recovered_leases}")
+        except BaseException:
+            self.instance_lock.release()
+            raise
+
+    def _request_fatal_shutdown(self, reason: str) -> None:
+        if self._fatal_shutdown_requested.is_set():
+            return
+        self._fatal_shutdown_requested.set()
+        log_event("bridge", f"fatal shutdown requested: {reason}", level="ERROR")
+        self.stop_event.set()
+        self.outbox_wakeup.set()
+        threading.Thread(
+            target=self.stop,
+            kwargs={"force_if_running": False},
+            name="bridge-fatal-stop",
+            daemon=True,
+        ).start()
 
     def run(self) -> None:
-        self.monitor.start()
-        self.worker.start()
+        log_event("bridge", "service starting")
         try:
+            with self._stop_state_lock:
+                if self._stop_started.is_set():
+                    return
+                self.monitor.start()
+                self.worker.start()
+                self.outbox_worker.start()
             self.gateway.run_forever()
         finally:
-            self.stop()
-
-    def stop(self) -> None:
-        if self._stop_started.is_set():
-            if self.runner.running():
-                print("[bridge] second stop request: cancelling Codex task", flush=True)
-                self.runner.cancel()
-            return
-        self._stop_started.set()
-        self.stop_event.set()
-        self.gateway.stop()
-        if self.worker.is_alive() and threading.current_thread() is not self.worker:
-            if self.runner.running():
-                print(
-                    "[bridge] waiting for current Codex task; send stop again to cancel",
-                    flush=True,
+            self.stop(force_if_running=False)
+            if self._components_stopped:
+                self.instance_lock.release()
+            else:
+                log_event(
+                    "bridge",
+                    "instance lock retained because shutdown did not complete cleanly",
+                    level="ERROR",
                 )
-            self.worker.join()
-        self.monitor.stop()
+
+    def stop(self, force_if_running: bool = True) -> None:
+        with self._stop_state_lock:
+            first_request = not self._stop_started.is_set()
+            if first_request:
+                self._stop_started.set()
+        if not first_request:
+            if force_if_running and self.runner.running():
+                log_event("bridge", "second stop request: cancelling Codex task", level="WARNING")
+                self.runner.cancel()
+            self._stop_complete.wait()
+            return
+        self.stop_event.set()
+        clean = True
+        try:
+            outbox_wakeup = getattr(self, "outbox_wakeup", None)
+            if outbox_wakeup is not None:
+                outbox_wakeup.set()
+            try:
+                self.gateway.stop()
+            except Exception as exc:
+                clean = False
+                log_event("bridge", f"gateway stop failed: {exc}", level="ERROR")
+            try:
+                if self.worker.is_alive() and threading.current_thread() is not self.worker:
+                    if self.runner.running():
+                        log_event(
+                            "bridge",
+                            "waiting for current Codex task; send stop again to cancel",
+                        )
+                    self.worker.join()
+            except Exception as exc:
+                clean = False
+                log_event("bridge", f"worker stop failed: {exc}", level="ERROR")
+            outbox_worker = getattr(self, "outbox_worker", None)
+            try:
+                if (
+                    outbox_worker is not None
+                    and outbox_worker.is_alive()
+                    and threading.current_thread() is not outbox_worker
+                ):
+                    outbox_worker.join()
+            except Exception as exc:
+                clean = False
+                log_event("bridge", f"outbox stop failed: {exc}", level="ERROR")
+            try:
+                self.monitor.stop()
+            except Exception as exc:
+                clean = False
+                log_event("bridge", f"monitor stop failed: {exc}", level="ERROR")
+            if self.worker.is_alive():
+                clean = False
+            if outbox_worker is not None and outbox_worker.is_alive():
+                clean = False
+            monitor_thread = getattr(self.monitor, "thread", None)
+            if monitor_thread is not None and monitor_thread.is_alive():
+                clean = False
+        finally:
+            self._components_stopped = clean
+            self._stop_complete.set()
+            log_event("bridge", "service stopped")
+
+    def _restore_persisted_jobs(self) -> None:
+        recoverable, uncertain = self.store.recover_jobs()
+        for job in recoverable:
+            self.jobs.put_nowait(job.job_id)
+        for job in uncertain:
+            openid = str(job.payload.get("openid") or self._current_openid())
+            error = "Bridge 在任务启动或执行期间退出，未自动重跑以避免重复执行。"
+            self._set_job_status_with_notification(
+                job.job_id,
+                "interrupted",
+                error,
+                openid,
+                "Bridge 在该任务启动或执行期间退出，无法确认 Codex 是否已经执行。"
+                "为避免重复操作，本任务不会自动重跑，请先检查任务记录后再决定是否重试。",
+                dedupe_key=f"job:{job.job_id}:interrupted",
+            )
+            self._cleanup_job_attachments(job.payload)
+        if recoverable or uncertain:
+            log_event(
+                "recovery",
+                f"queued={len(recoverable)} interrupted={len(uncertain)}",
+            )
+
+    def _set_worker_state(self, stage: str, job_id: str = "", error: str = "") -> None:
+        with self._runtime_lock:
+            self.worker_stage = stage
+            self.current_job_id = job_id
+            if error:
+                self.last_worker_error = error[-400:]
+
+    def _on_gateway_state(self, state: str, detail: str) -> None:
+        with self._runtime_lock:
+            self.gateway_state = state
+            self.gateway_detail = detail[-400:]
+        if state == "ready":
+            self.gateway_ready.set()
+            self.outbox_wakeup.set()
+        else:
+            self.gateway_ready.clear()
+
+    def _cleanup_job_attachments(self, payload: Dict[str, Any]) -> None:
+        raw_dir = str(payload.get("attachment_dir") or "")
+        if not raw_dir:
+            return
+        root = (self.config.base_dir / "data" / "attachments").resolve()
+        try:
+            path = Path(raw_dir).resolve()
+            path.relative_to(root)
+            if path != root:
+                shutil.rmtree(path)
+        except (OSError, ValueError) as exc:
+            log_event(
+                "attachments",
+                f"cleanup rejected or failed: {exc}",
+                level="ERROR",
+            )
 
     def _current_openid(self) -> str:
         return self.config.qq_allowed_openid or self.bound_openid
+
+    @staticmethod
+    def _redact_openid(error: object, openid: str) -> str:
+        detail = str(error)
+        if not openid:
+            return detail
+        for value in {openid, quote(openid, safe="")}:
+            if value:
+                detail = detail.replace(value, "[openid]")
+        return detail
 
     @staticmethod
     def _button(label: str, command: str, style: int = 0) -> Dict[str, Any]:
@@ -146,6 +352,30 @@ class BridgeService:
             ]
         )
 
+    def _send_chunk(
+        self,
+        openid: str,
+        text: str,
+        msg_id: str = "",
+        keyboard: Optional[Dict[str, Any]] = None,
+        msg_seq: int = 1,
+    ) -> None:
+        if not openid:
+            return
+        with self._send_lock:
+            try:
+                self.api.send_c2c_markdown(
+                    openid,
+                    text,
+                    msg_id=msg_id,
+                    msg_seq=msg_seq,
+                    keyboard=keyboard,
+                )
+            except Exception as exc:
+                detail = self._redact_openid(exc, openid)
+                log_event("qq-markdown", f"fallback: {detail}", level="WARNING")
+                self.api.send_c2c(openid, text, msg_id=msg_id, msg_seq=msg_seq)
+
     def _send_text(
         self,
         openid: str,
@@ -154,27 +384,20 @@ class BridgeService:
         keyboard: Optional[Dict[str, Any]] = None,
         start_seq: int = 1,
     ) -> None:
-        if not openid:
-            return
         max_chunks = self.config.qq_reply_chunks
         if msg_id:
             max_chunks = min(max_chunks, max(1, 5 - start_seq))
         chunks = split_message(text, self.config.qq_reply_chars, max_chunks)
-        with self._send_lock:
-            for index, chunk in enumerate(chunks, start_seq):
-                try:
-                    self.api.send_c2c_markdown(
-                        openid,
-                        chunk,
-                        msg_id=msg_id,
-                        msg_seq=index,
-                        keyboard=keyboard if index == start_seq else None,
-                    )
-                except Exception as exc:
-                    print(f"[qq-markdown-fallback] {exc}", flush=True)
-                    self.api.send_c2c(openid, chunk, msg_id=msg_id, msg_seq=index)
-                if len(chunks) > 1:
-                    time.sleep(0.35)
+        for index, chunk in enumerate(chunks, start_seq):
+            self._send_chunk(
+                openid,
+                chunk,
+                msg_id=msg_id,
+                keyboard=keyboard if index == start_seq else None,
+                msg_seq=index,
+            )
+            if len(chunks) > 1:
+                time.sleep(0.35)
 
     def _safe_send(
         self,
@@ -183,30 +406,304 @@ class BridgeService:
         msg_id: str = "",
         keyboard: Optional[Dict[str, Any]] = None,
         start_seq: int = 1,
-    ) -> None:
+        dedupe_key: str = "",
+    ) -> bool:
         try:
-            self._send_text(openid, text, msg_id, keyboard, start_seq)
+            items = self._text_outbox_specs(
+                openid,
+                text,
+                msg_id,
+                keyboard,
+                start_seq,
+                dedupe_key,
+            )
+            if not items:
+                return False
+            self.store.enqueue_outbox_batch(items)
+            self.outbox_wakeup.set()
+            return True
         except Exception as exc:
-            print(f"[qq-send] {exc}", flush=True)
+            log_event("qq-outbox", f"enqueue failed: {exc}", level="ERROR")
+            return False
+
+    def _text_outbox_specs(
+        self,
+        openid: str,
+        text: str,
+        msg_id: str = "",
+        keyboard: Optional[Dict[str, Any]] = None,
+        start_seq: int = 1,
+        dedupe_key: str = "",
+    ) -> List[OutboxSpec]:
+        if not openid:
+            return []
+        max_chunks = self.config.qq_reply_chunks
+        if msg_id:
+            max_chunks = min(max_chunks, max(1, 5 - start_seq))
+        chunks = split_message(text, self.config.qq_reply_chars, max_chunks)
+        if dedupe_key:
+            group_key = dedupe_key
+        elif msg_id:
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "openid": openid,
+                        "text": text,
+                        "msg_id": msg_id,
+                        "start_seq": start_seq,
+                        "keyboard": keyboard,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            group_key = f"reply:{msg_id}:{fingerprint}"
+        else:
+            group_key = f"notice:{uuid.uuid4().hex}"
+        return [
+            OutboxSpec(
+                f"{group_key}:chunk:{index}",
+                {
+                    "kind": "text",
+                    "openid": openid,
+                    "text": chunk,
+                    "msg_id": msg_id,
+                    "msg_seq": index,
+                    "keyboard": keyboard if index == start_seq else None,
+                },
+                group_key,
+            )
+            for index, chunk in enumerate(chunks, start_seq)
+        ]
+
+    def _set_job_status_with_notification(
+        self,
+        job_id: str,
+        status: str,
+        error: str,
+        openid: str,
+        text: str,
+        *,
+        dedupe_key: str,
+        process_id: Optional[int] = None,
+    ) -> None:
+        items = self._text_outbox_specs(
+            openid,
+            text,
+            dedupe_key=dedupe_key,
+        )
+        if not items:
+            raise RuntimeError("任务状态通知缺少 QQ 收件人")
+        self.store.set_job_status_with_outbox(
+            job_id,
+            status,
+            items,
+            process_id=process_id,
+            error=error,
+        )
+        self.outbox_wakeup.set()
 
     def _safe_typing(self, openid: str, msg_id: str) -> None:
         try:
             self.api.send_c2c_typing(openid, msg_id, seconds=60)
         except Exception as exc:
-            print(f"[qq-typing] {exc}", flush=True)
+            log_event(
+                "qq-typing",
+                self._redact_openid(exc, openid),
+                level="WARNING",
+            )
 
-    def _safe_send_images(self, openid: str, paths: List[Path]) -> None:
+    def _safe_send_images(
+        self,
+        openid: str,
+        paths: List[Path],
+        dedupe_key: str = "",
+    ) -> bool:
+        with self._outbox_image_lock:
+            items, success = self._image_outbox_specs(openid, paths, dedupe_key)
+            if items:
+                try:
+                    self.store.enqueue_outbox_batch(items)
+                    self.outbox_wakeup.set()
+                except Exception as exc:
+                    success = False
+                    log_event("qq-image", f"enqueue failed: {exc}", level="ERROR")
+                finally:
+                    self._cleanup_unreferenced_outbox_images()
+            return success
+
+    def _outbox_image_root(self) -> Path:
+        return (self.config.base_dir / "data" / "outbox-images").resolve()
+
+    def _spool_outbox_image(self, path: Path, group_key: str, index: int) -> Path:
+        source = path.resolve()
+        root = self._outbox_image_root()
+        group_dir = root / hashlib.sha256(group_key.encode("utf-8")).hexdigest()
+        group_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            root.chmod(0o700)
+            group_dir.chmod(0o700)
+        except OSError:
+            pass
+        suffix = source.suffix.lower()
+        target = group_dir / f"{index:02d}{suffix}"
+        if source == target or (
+            target.is_file()
+            and not target.is_symlink()
+            and target.stat().st_size == source.stat().st_size
+        ):
+            return target.resolve()
+        staging = group_dir / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(source, staging)
+            try:
+                staging.chmod(0o600)
+            except OSError:
+                pass
+            staging.replace(target)
+        finally:
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return target.resolve()
+
+    def _cleanup_unreferenced_outbox_images(self) -> None:
+        with self._outbox_image_lock:
+            root = self._outbox_image_root()
+            if not root.is_dir():
+                return
+            try:
+                referenced = {
+                    str(Path(value).resolve())
+                    for value in self.store.pending_outbox_image_paths()
+                }
+                for candidate in root.rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    resolved = candidate.resolve()
+                    resolved.relative_to(root)
+                    if str(resolved) not in referenced:
+                        resolved.unlink(missing_ok=True)
+                directories = sorted(
+                    (path for path in root.rglob("*") if path.is_dir()),
+                    key=lambda path: len(path.parts),
+                    reverse=True,
+                )
+                for directory in directories:
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                log_event("qq-image", f"spool cleanup failed: {exc}", level="WARNING")
+
+    def _image_outbox_specs(
+        self,
+        openid: str,
+        paths: List[Path],
+        dedupe_key: str = "",
+    ) -> tuple[List[OutboxSpec], bool]:
+        success = True
+        group_key = dedupe_key or f"image:{uuid.uuid4().hex}"
+        items: List[OutboxSpec] = []
         for index, path in enumerate(paths, 1):
             try:
                 if path.stat().st_size > self.config.qq_attachment_max_bytes:
-                    print(f"[qq-image] skipped oversized image: {path.name}", flush=True)
+                    log_event(
+                        "qq-image",
+                        f"skipped oversized image: {path.name}",
+                        level="WARNING",
+                    )
                     continue
-                file_info = self.api.upload_c2c_image(openid, path)
-                self.api.send_c2c_media(openid, file_info, msg_seq=index)
+                spooled_path = self._spool_outbox_image(path, group_key, index)
+                payload = {
+                    "kind": "image",
+                    "openid": openid,
+                    "path": str(spooled_path),
+                    "msg_seq": index,
+                }
+                item_key = (
+                    f"{dedupe_key}:image:{index}"
+                    if dedupe_key
+                    else f"{group_key}:item:{index}"
+                )
+                items.append(OutboxSpec(item_key, payload, group_key))
             except Exception as exc:
-                print(f"[qq-image] {path.name}: {exc}", flush=True)
+                success = False
+                log_event("qq-image", f"{path.name}: {exc}", level="ERROR")
+        return items, success
+
+    def _deliver_outbox(self, item: OutboxItem) -> None:
+        payload = item.payload
+        kind = str(payload.get("kind") or "")
+        openid = str(payload.get("openid") or "")
+        if kind == "text":
+            raw_keyboard = payload.get("keyboard")
+            keyboard = raw_keyboard if isinstance(raw_keyboard, dict) else None
+            self._send_chunk(
+                openid,
+                str(payload.get("text") or ""),
+                msg_id=str(payload.get("msg_id") or ""),
+                msg_seq=int(payload.get("msg_seq") or 1),
+                keyboard=keyboard,
+            )
+            return
+        if kind == "image":
+            path = Path(str(payload.get("path") or ""))
+            if not path.is_file():
+                raise FileNotFoundError(f"待发送图片不存在: {path.name}")
+            file_info = self.api.upload_c2c_image(openid, path)
+            self.api.send_c2c_media(
+                openid,
+                file_info,
+                msg_seq=int(payload.get("msg_seq") or 1),
+            )
+            return
+        raise ValueError(f"未知 outbox 类型: {kind}")
+
+    def _outbox_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if not self.gateway_ready.is_set():
+                    self.outbox_wakeup.wait(1)
+                    self.outbox_wakeup.clear()
+                    continue
+                item = self.store.claim_due_outbox()
+                if item is None:
+                    self.outbox_wakeup.wait(1)
+                    self.outbox_wakeup.clear()
+                    continue
+                try:
+                    self._deliver_outbox(item)
+                except Exception as exc:
+                    delay = min(300, max(2, 2 ** min(item.attempts + 1, 8)))
+                    openid = str(item.payload.get("openid") or "")
+                    detail = self._redact_openid(exc, openid)
+                    log_event(
+                        "qq-outbox",
+                        f"delivery failed id={item.outbox_id} "
+                        f"retry_in={delay}s error={detail}",
+                        level="ERROR",
+                    )
+                    self.store.retry_outbox(item.outbox_id, detail, delay)
+                    self.stop_event.wait(min(1, delay))
+                else:
+                    self.store.mark_outbox_sent(item.outbox_id)
+                    if item.payload.get("kind") == "image":
+                        self._cleanup_unreferenced_outbox_images()
+                    log_event("qq-outbox", f"delivered id={item.outbox_id}")
+                    time.sleep(0.35)
+            except Exception as exc:
+                log_event(
+                    "qq-outbox",
+                    f"worker recovered from storage error: {exc}",
+                    level="ERROR",
+                )
+                self.stop_event.wait(2)
 
     def _on_gateway_ready(self) -> None:
+        self._on_gateway_state("ready", "")
         log_event("bridge", "QQ Gateway is ready")
         if not self.config.qq_notify_on_ready:
             return
@@ -214,14 +711,15 @@ class BridgeService:
         if openid:
             if self._online_notice_sent.is_set():
                 return
-            self._online_notice_sent.set()
             active = self.active_thread.snapshot()
-            self._safe_send(
+            queued = self._safe_send(
                 openid,
                 "## Codex Chat Bridge 已上线\n\n"
                 f"当前任务：**{self._short_title(active.title)}**",
                 keyboard=self._main_keyboard(),
             )
+            if queued:
+                self._online_notice_sent.set()
         else:
             log_event("bridge", "waiting for /bind <code>")
 
@@ -239,7 +737,7 @@ class BridgeService:
             event["message_id"],
             keyboard=self._main_keyboard(),
         )
-        print(f"[bridge] bound openid={self.bound_openid[:8]}...", flush=True)
+        log_event("bridge", "QQ user binding completed")
 
     def _status_text(self) -> str:
         active = self.active_thread.snapshot()
@@ -247,16 +745,31 @@ class BridgeService:
             self.config.codex_sessions_dir, active.thread_id
         )
         busy = path is not None and self._session_busy_without_checkpoint(path)
-        queue_size = self.jobs.qsize()
+        queue_size = self.store.active_job_count()
+        pending_notifications = self.store.pending_outbox_count()
+        latest_job = self.store.latest_job()
+        with self._runtime_lock:
+            gateway_state = self.gateway_state
+            worker_stage = self.worker_stage
+            last_worker_error = self.last_worker_error
+        safe_error = ""
+        if last_worker_error:
+            safe_error, _images = qq_safe_final(last_worker_error, active.workdir, max_images=0)
         return "\n".join(
             [
                 "Codex Chat Bridge 状态",
                 f"标题：{self._short_title(active.title, 60)}",
                 f"任务：{active.thread_id}",
                 f"Codex：{'执行中' if busy or self.runner.running() else '空闲'}",
-                f"QQ 队列：{queue_size}",
+                f"Worker 阶段：{worker_stage}",
+                f"最近任务状态：{latest_job.status if latest_job else '无'}",
+                f"持久任务：{queue_size}",
+                f"QQ Gateway：{gateway_state}",
+                f"待发送通知：{pending_notifications}",
+                f"最近执行错误：{safe_error or '无'}",
                 f"会话文件：{'已找到' if path else '未找到'}",
                 f"工作目录：{active.workdir}",
+                f"日志：{self.config.base_dir / 'data' / 'logs' / 'bridge.jsonl'}",
             ]
         )
 
@@ -351,7 +864,7 @@ class BridgeService:
             self.worker_busy.is_set()
             or self.runner.running()
             or session_is_busy
-            or not self.jobs.empty()
+            or self.store.active_job_count() > 0
         )
 
     def _switch_thread(self, selector: str) -> str:
@@ -394,7 +907,125 @@ class BridgeService:
             lines.extend(["", "该任务暂时没有完整的本地对话记录。"])
         return "\n".join(lines)
 
+    def _persist_inbound_images(self, event: Dict[str, Any]) -> tuple[List[Path], str]:
+        attachments = event.get("attachments") or []
+        if not attachments:
+            return [], ""
+        message_id = str(event["message_id"])
+        directory_name = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+        root = self.config.base_dir / "data" / "attachments"
+        target = root / directory_name
+        if target.is_dir():
+            existing = sorted(path for path in target.iterdir() if path.is_file())
+            if existing:
+                return existing, str(target.resolve())
+        root.mkdir(parents=True, exist_ok=True)
+        staging = root / f".{directory_name}-{uuid.uuid4().hex}.tmp"
+        try:
+            paths = download_c2c_images(
+                attachments,
+                staging,
+                self.config.qq_attachment_max_bytes,
+                self.config.qq_attachment_max_images,
+            )
+            if not paths:
+                raise ValueError("消息中没有可处理的图片")
+            if target.exists():
+                shutil.rmtree(target)
+            staging.replace(target)
+            persisted = [target / path.name for path in paths]
+            return persisted, str(target.resolve())
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+    def _accept_remote_job(
+        self,
+        event: Dict[str, Any],
+        *,
+        action: str,
+        thread_id: str,
+        workdir: Path,
+        content: str,
+        accepted_text: str,
+    ) -> bool:
+        if self.stop_event.is_set():
+            log_event("bridge", "ignored remote job during shutdown")
+            return False
+        message_id = str(event["message_id"])
+        existing = self.store.get_job_by_message(message_id)
+        if existing is not None:
+            self._safe_send(
+                str(event["openid"]),
+                accepted_text,
+                message_id,
+                start_seq=2,
+                dedupe_key=f"job:{existing.job_id}:accepted",
+            )
+            self.outbox_wakeup.set()
+            return True
+        attachment_dir = ""
+        image_paths: List[Path] = []
+        try:
+            image_paths, attachment_dir = self._persist_inbound_images(event)
+            if self.stop_event.is_set():
+                if attachment_dir:
+                    self._cleanup_job_attachments({"attachment_dir": attachment_dir})
+                log_event("bridge", "deferred remote job acceptance during shutdown")
+                return False
+            payload: Dict[str, Any] = {
+                "openid": str(event["openid"]),
+                "message_id": message_id,
+                "content": content,
+                "action": action,
+                "thread_id": thread_id,
+                "workdir": str(workdir.resolve()),
+                "image_paths": [str(path.resolve()) for path in image_paths],
+                "attachment_dir": attachment_dir,
+            }
+            job, created = self.store.enqueue_job(message_id, payload, max_active=20)
+        except OverflowError:
+            if attachment_dir:
+                self._cleanup_job_attachments({"attachment_dir": attachment_dir})
+            self._safe_send(
+                str(event["openid"]),
+                "远程任务队列已满，请稍后再试。",
+                message_id,
+                start_seq=2,
+            )
+            return False
+        except Exception as exc:
+            if attachment_dir:
+                self._cleanup_job_attachments({"attachment_dir": attachment_dir})
+            detail = summarize_codex_error(str(exc), max_chars=300)
+            safe_detail, _images = qq_safe_final(detail, workdir, max_images=0)
+            self._safe_send(
+                str(event["openid"]),
+                f"消息保存失败，本条任务未进入队列：\n{safe_detail}",
+                message_id,
+                start_seq=2,
+            )
+            log_event("job-store", f"accept failed: {exc}", level="ERROR")
+            return False
+        if created:
+            self.jobs.put_nowait(job.job_id)
+            log_event(
+                "job-store",
+                f"accepted job={job.job_id} action={action} thread={thread_id}",
+            )
+        self._safe_send(
+            str(event["openid"]),
+            accepted_text,
+            message_id,
+            start_seq=2,
+            dedupe_key=f"job:{job.job_id}:accepted",
+        )
+        return True
+
     def _on_qq_event(self, event: Dict[str, Any]) -> None:
+        if self.stop_event.is_set():
+            log_event("bridge", "ignored QQ event during shutdown")
+            return
         openid = event["openid"]
         content = event["content"].strip()
         if not self._current_openid():
@@ -404,7 +1035,7 @@ class BridgeService:
                 self._safe_send(openid, "请先发送：/bind 你的绑定码", event["message_id"])
             return
         if openid != self._current_openid():
-            print(f"[bridge] blocked openid={openid[:8]}...", flush=True)
+            log_event("bridge", "blocked message from unbound QQ user", level="WARNING")
             return
 
         parts = content.split(None, 1)
@@ -440,7 +1071,7 @@ class BridgeService:
             except ValueError:
                 text = "用法：/threads 或 /threads 正整数页码"
             except Exception as exc:
-                print(f"[thread-index] {exc}", flush=True)
+                log_event("thread-index", str(exc), level="ERROR")
                 text = "暂时无法读取本机 Codex 任务列表。"
             keyboard = None
             if not text.startswith("用法") and not text.startswith("暂时"):
@@ -457,7 +1088,7 @@ class BridgeService:
                     self.config.qq_attachment_max_images,
                 )
             except Exception as exc:
-                print(f"[thread-switch] {exc}", flush=True)
+                log_event("thread-switch", str(exc), level="ERROR")
                 text = f"切换失败：{exc}"
                 images = []
             self._safe_send(
@@ -518,23 +1149,15 @@ class BridgeService:
                 return
             active = self.active_thread.snapshot()
             self._safe_typing(openid, event["message_id"])
-            job = dict(event)
-            job.update(action="new", workdir=str(active.workdir), content=argument)
-            try:
-                self.jobs.put_nowait(job)
-            except queue.Full:
-                self._safe_send(
-                    openid,
-                    "远程任务队列已满，请稍后再试。",
-                    event["message_id"],
-                    start_seq=2,
-                )
-                return
-            self._safe_send(
-                openid,
-                f"收到，正在项目 {active.project_name} 中新建 Codex 任务。",
-                event["message_id"],
-                start_seq=2,
+            self._accept_remote_job(
+                event,
+                action="new",
+                thread_id=active.thread_id,
+                workdir=active.workdir,
+                content=argument,
+                accepted_text=(
+                    f"已接收并保存，等待 Bridge 在项目 {active.project_name} 中调度新任务。"
+                ),
             )
             return
         if content.startswith("/"):
@@ -552,32 +1175,14 @@ class BridgeService:
 
         active = self.active_thread.snapshot()
         self._safe_typing(openid, event["message_id"])
-        job = dict(event)
-        job.update(
+        self._accept_remote_job(
+            event,
             action="resume",
             thread_id=active.thread_id,
-            workdir=str(active.workdir),
+            workdir=active.workdir,
+            content=content,
+            accepted_text="已接收并保存，等待 Bridge 调度当前 Codex 任务。",
         )
-        try:
-            self.jobs.put_nowait(job)
-        except queue.Full:
-            self._safe_send(
-                openid,
-                "远程任务队列已满，请稍后再试。",
-                event["message_id"],
-                start_seq=2,
-            )
-            return
-        path = self.monitor.path or find_session_file(
-            self.config.codex_sessions_dir, active.thread_id
-        )
-        waiting = (
-            self.runner.running()
-            or (path is not None and self._session_busy_without_checkpoint(path))
-            or self.jobs.qsize() > 1
-        )
-        message = "已排队，当前任务结束后继续。" if waiting else "收到，正在继续当前 Codex 任务。"
-        self._safe_send(openid, message, event["message_id"], start_seq=2)
 
     def _wait_until_idle(self, thread_id: str) -> bool:
         deadline = time.time() + self.config.queue_wait_timeout
@@ -629,100 +1234,483 @@ class BridgeService:
     def _worker_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                event = self.jobs.get(timeout=0.5)
+                job_id = self.jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
-            self.worker_busy.set()
+            job: Optional[StoredJob] = None
+            result: Optional[JobRunResult] = None
+            terminal = False
             stage = "prepare"
             try:
+                try:
+                    job = self.store.claim_job(job_id)
+                except sqlite3.Error as exc:
+                    log_event(
+                        "job-store",
+                        f"claim failed; requeued in memory job={job_id}: {exc}",
+                        level="ERROR",
+                    )
+                    if not self.stop_event.is_set():
+                        self.jobs.put_nowait(job_id)
+                    self.stop_event.wait(1)
+                    continue
+                if job is None:
+                    continue
+                event = job.payload
+                self.worker_busy.set()
+                self._set_worker_state(stage, job_id)
                 action = event.get("action", "resume")
                 target_thread_id = event.get("thread_id") or self.active_thread.snapshot().thread_id
                 log_event(
                     "worker",
-                    f"started action={action} thread={target_thread_id}",
+                    f"claimed job={job_id} action={action} thread={target_thread_id}",
                 )
                 stage = "wait-for-idle"
+                self.store.set_job_status(job_id, "waiting")
+                self._set_worker_state(stage, job_id)
+                path = find_session_file(self.config.codex_sessions_dir, target_thread_id)
+                already_waiting = self.runner.running() or (
+                    path is not None and self._session_busy_without_checkpoint(path)
+                )
+                if already_waiting:
+                    self._safe_send(
+                        str(event["openid"]),
+                        "当前 Codex 任务仍在执行，本条消息已保存并进入等待队列。",
+                        dedupe_key=f"job:{job_id}:waiting",
+                    )
                 if not self._wait_until_idle(target_thread_id):
-                    self._safe_send(event["openid"], "等待当前任务结束超时，本条消息未执行。")
-                    log_event("worker", f"timed out stage={stage} thread={target_thread_id}")
+                    if self.stop_event.is_set():
+                        self.store.set_job_status(job_id, "queued")
+                        log_event("worker", f"deferred during shutdown job={job_id}")
+                        continue
+                    error = "等待当前任务结束超时，本条消息未执行。"
+                    result = JobRunResult(target_thread_id, "failed", error, error)
+                    stage = "finalize"
+                    terminal = self._persist_job_result_with_retry(job, result)
+                    if not terminal:
+                        self._set_worker_state("persistence-failed", job_id, error)
+                        continue
+                    self._set_worker_state("failed", job_id, error)
+                    log_event(
+                        "worker",
+                        f"timed out waiting job={job_id} thread={target_thread_id}",
+                        level="ERROR",
+                    )
                     continue
                 stage = "prepare-input"
+                self.store.set_job_status(job_id, "preparing")
+                self._set_worker_state(stage, job_id)
                 workdir = Path(event.get("workdir") or str(self.config.codex_workdir))
-                attachments = event.get("attachments") or []
                 prompt = str(event.get("content") or "").strip()
-                if attachments and not prompt:
+                image_paths = [Path(str(value)) for value in event.get("image_paths") or []]
+                if image_paths and not prompt:
                     prompt = "请查看我发送的图片，并根据图片内容继续处理。"
-                temp_parent = self.config.base_dir / "data"
-                temp_parent.mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryDirectory(prefix="qq-images-", dir=temp_parent) as raw_dir:
-                    stage = "download-attachments"
-                    image_paths = download_c2c_images(
-                        attachments,
-                        Path(raw_dir),
-                        self.config.qq_attachment_max_bytes,
-                        self.config.qq_attachment_max_images,
+                missing = [path.name for path in image_paths if not path.is_file()]
+                if missing:
+                    raise FileNotFoundError(f"已保存的输入图片不存在: {', '.join(missing)}")
+                if self.stop_event.is_set():
+                    self.store.set_job_status(job_id, "queued")
+                    log_event("worker", f"deferred before dispatch job={job_id}")
+                    continue
+                stage = "run-codex"
+                self.store.set_job_status(job_id, "dispatching")
+                self._set_worker_state("dispatching", job_id)
+                result = self._run_job(
+                    job_id,
+                    event,
+                    action,
+                    target_thread_id,
+                    workdir,
+                    prompt,
+                    image_paths,
+                )
+                stage = "finalize"
+                terminal = self._persist_job_result_with_retry(job, result)
+                if not terminal:
+                    self._set_worker_state(
+                        "persistence-failed",
+                        job_id,
+                        result.error or "terminal persistence failed",
                     )
-                    if attachments and not image_paths:
-                        raise ValueError("消息中没有可处理的图片")
-                    refreshed_thread_id = target_thread_id
-                    try:
-                        stage = "run-codex"
-                        refreshed_thread_id = self._run_job(
-                            event,
-                            action,
-                            target_thread_id,
-                            workdir,
-                            prompt,
-                            image_paths,
-                        )
-                    except Exception:
-                        if action == "new":
-                            refreshed_thread_id = self.active_thread.snapshot().thread_id
-                        self._mark_thread_idle(refreshed_thread_id)
-                        self._refresh_desktop(refreshed_thread_id)
-                        raise
-                    stage = "finalize"
-                    if action == "new":
-                        refreshed_thread_id = self.active_thread.snapshot().thread_id
-                    self._mark_thread_idle(refreshed_thread_id)
-                    self._refresh_desktop(refreshed_thread_id)
+                    continue
+                self._set_worker_state(
+                    result.status,
+                    job_id,
+                    result.error if result.status != "succeeded" else "",
+                )
+                refreshed_thread_id = result.thread_id
+                if action == "new":
+                    refreshed_thread_id = self.active_thread.snapshot().thread_id
+                self._mark_thread_idle(refreshed_thread_id)
+                self._refresh_desktop(refreshed_thread_id)
                 log_event(
                     "worker",
-                    f"completed action={action} thread={refreshed_thread_id}",
+                    f"finished job={job_id} status={result.status} "
+                    f"action={action} thread={refreshed_thread_id}",
+                    level="INFO" if result.status == "succeeded" else "ERROR",
                 )
             except Exception as exc:
+                error = summarize_codex_error(str(exc), max_chars=400)
                 log_event(
                     "worker",
-                    f"failed stage={stage}\n{traceback.format_exc()}",
+                    f"failed job={job.job_id if job else job_id} stage={stage}\n"
+                    f"{traceback.format_exc()}",
+                    level="ERROR",
                 )
-                workdir = Path(event.get("workdir") or str(self.config.codex_workdir))
-                detail = summarize_codex_error(str(exc), max_chars=400)
-                safe_detail, _images = qq_safe_final(detail, workdir, max_images=0)
-                self._safe_send(
-                    event["openid"],
-                    f"Codex 任务处理失败（阶段：{stage}）：\n{safe_detail}",
-                )
+                if job is not None and not terminal:
+                    persisted: Optional[StoredJob] = None
+                    try:
+                        persisted = self.store.get_job(job.job_id)
+                    except Exception as status_exc:
+                        log_event(
+                            "job-store",
+                            f"failed to inspect job state id={job.job_id}: {status_exc}",
+                            level="ERROR",
+                        )
+                    if result is None:
+                        workdir = Path(
+                            job.payload.get("workdir") or str(self.config.codex_workdir)
+                        )
+                        safe_detail, _images = qq_safe_final(
+                            error,
+                            workdir,
+                            max_images=0,
+                        )
+                        uncertain = isinstance(exc, JobDispatchUncertainError) or (
+                            persisted is not None and persisted.status == "running"
+                        )
+                        if uncertain:
+                            status = "interrupted"
+                            message = (
+                                "Codex 子进程已经启动，但 Bridge 无法确认任务是否完整执行。"
+                                "为避免重复操作，请先检查任务记录后再决定是否重试。\n"
+                                f"详情：{safe_detail}"
+                            )
+                        else:
+                            status = "failed"
+                            message = f"Codex 任务处理失败（阶段：{stage}）：\n{safe_detail}"
+                        result = JobRunResult(
+                            str(job.payload.get("thread_id") or ""),
+                            status,
+                            error,
+                            message,
+                        )
+                    terminal = self._persist_job_result_with_retry(job, result)
+                    self._set_worker_state(
+                        result.status if terminal else "persistence-failed",
+                        job.job_id,
+                        result.error,
+                    )
             finally:
+                if terminal and job is not None:
+                    self._cleanup_job_attachments(job.payload)
                 self.worker_busy.clear()
+                self._set_worker_state("idle")
                 self.jobs.task_done()
+
+    def _persist_job_result_with_retry(
+        self,
+        job: StoredJob,
+        result: JobRunResult,
+    ) -> bool:
+        for attempt in range(1, 3):
+            try:
+                self._persist_job_result(job, result)
+                return True
+            except Exception as exc:
+                log_event(
+                    "job-store",
+                    f"terminal persistence attempt={attempt} job={job.job_id}: {exc}",
+                    level="ERROR",
+                )
+                if attempt == 1:
+                    time.sleep(0.2)
+        self._cleanup_unreferenced_outbox_images()
+        self._request_fatal_shutdown(
+            f"job={job.job_id} terminal persistence failed twice"
+        )
+        return False
+
+    def _persist_job_result(self, job: StoredJob, result: JobRunResult) -> None:
+        if result.status == "succeeded":
+            if not result.final_message:
+                raise RuntimeError("成功任务缺少最终结果")
+            if not result.event_id:
+                raise RuntimeError("成功任务缺少可去重的会话事件标识")
+            thread = self._thread_info_for_job_result(job, result)
+            openid = str(job.payload.get("openid") or self._current_openid())
+            dedupe_key = f"session-final:{result.event_id}"
+            with self._outbox_image_lock:
+                items = self._final_outbox_specs(
+                    openid,
+                    thread,
+                    result.final_message,
+                    dedupe_key,
+                )
+                if not items:
+                    raise RuntimeError("成功任务通知缺少 QQ 收件人")
+                self.store.set_job_status_with_outbox(
+                    job.job_id,
+                    "succeeded",
+                    items,
+                )
+                self._cleanup_unreferenced_outbox_images()
+            self.outbox_wakeup.set()
+            return
+        if not result.notification:
+            raise RuntimeError("终态任务缺少用户通知")
+        dedupe_key = (
+            f"session-interrupted:{result.event_id}"
+            if result.event_id
+            else f"job:{job.job_id}:terminal"
+        )
+        self._set_job_status_with_notification(
+            job.job_id,
+            result.status,
+            result.error,
+            str(job.payload.get("openid") or self._current_openid()),
+            result.notification,
+            dedupe_key=dedupe_key,
+        )
+
+    def _thread_info_for_job_result(
+        self,
+        job: StoredJob,
+        result: JobRunResult,
+    ) -> ThreadInfo:
+        active = self.active_thread.snapshot()
+        if active.thread_id == result.thread_id:
+            return active
+        try:
+            indexed = self.thread_index.get(result.thread_id)
+        except sqlite3.Error as exc:
+            log_event("thread-index", f"result lookup failed: {exc}", level="WARNING")
+            indexed = None
+        if indexed is not None:
+            return indexed
+        workdir = Path(job.payload.get("workdir") or str(self.config.codex_workdir)).resolve()
+        return ThreadInfo(result.thread_id, result.thread_id, workdir)
+
+    def _on_job_started(
+        self,
+        job_id: str,
+        event: Dict[str, Any],
+        action: str,
+        process_id: int,
+    ) -> None:
+        message = (
+            "Codex 子进程已启动，正在创建新任务。"
+            if action == "new"
+            else "Codex 子进程已启动，正在执行当前任务。"
+        )
+        try:
+            self._set_job_status_with_notification(
+                job_id,
+                "running",
+                "",
+                str(event["openid"]),
+                message,
+                dedupe_key=f"job:{job_id}:started",
+                process_id=process_id,
+            )
+        except Exception as exc:
+            raise JobDispatchUncertainError(
+                "Codex 已启动，但 Bridge 无法持久化启动状态"
+            ) from exc
+        self._set_worker_state("running", job_id)
+
+    def _on_codex_diagnostic(
+        self,
+        job_id: str,
+        event: Dict[str, Any],
+        line: str,
+    ) -> None:
+        filtered = summarize_codex_error(line, max_chars=500)
+        if filtered == "没有错误详情":
+            return
+        lowered = filtered.lower()
+        category = ""
+        message = ""
+        if any(
+            marker in lowered
+            for marker in (
+                "unauthorized",
+                "authentication",
+                "not logged in",
+                "login required",
+                "invalid api key",
+                "http 401",
+            )
+        ):
+            category = "authentication"
+            message = "Codex 报告登录或鉴权异常，当前任务可能无法继续。"
+        elif any(marker in lowered for marker in ("rate limit", "too many requests", "http 429")):
+            category = "rate-limit"
+            message = "Codex 报告服务限流，CLI 可能正在等待后重试。"
+        elif any(
+            marker in lowered
+            for marker in (
+                "upstream request failed",
+                "service unavailable",
+                "bad gateway",
+                "gateway timeout",
+                "server error",
+                "http 502",
+                "http 503",
+                "http 504",
+            )
+        ):
+            category = "upstream"
+            message = "Codex 报告上游服务异常，CLI 可能正在自动重试。"
+        elif any(
+            marker in lowered
+            for marker in (
+                "stream disconnected",
+                "connection reset",
+                "connection refused",
+                "failed to connect",
+                "network is unreachable",
+                "dns error",
+                "timed out",
+            )
+        ):
+            category = "network"
+            message = "Codex 报告网络连接异常，CLI 可能正在自动重试。"
+        if not category:
+            return
+        log_event(
+            "codex-diagnostic",
+            f"job={job_id} category={category} detail={filtered}",
+            level="WARNING",
+        )
+        self._safe_send(
+            str(event["openid"]),
+            f"{message}\n\n任务尚未结束；最终成功或失败后会继续通知。",
+            dedupe_key=f"job:{job_id}:diagnostic:{category}",
+        )
+
+    def _rollout_checkpoint(self, thread_id: str) -> tuple[Optional[Path], int]:
+        path = find_session_file(self.config.codex_sessions_dir, thread_id)
+        if path is None:
+            return None, 0
+        try:
+            resolved = path.resolve()
+            return resolved, resolved.stat().st_size
+        except OSError:
+            return None, 0
+
+    def _latest_rollout_event_id(
+        self,
+        thread_id: str,
+        checkpoint: tuple[Optional[Path], int],
+        *,
+        final_message: str = "",
+        event_type: str = "",
+    ) -> str:
+        path = find_session_file(self.config.codex_sessions_dir, thread_id)
+        if path is None:
+            return ""
+        try:
+            path = path.resolve()
+            checkpoint_path, checkpoint_offset = checkpoint
+            start_offset = checkpoint_offset if checkpoint_path == path else 0
+            if start_offset > path.stat().st_size:
+                start_offset = 0
+            expected_final = final_message.strip()
+            latest = ""
+            with path.open("rb") as handle:
+                handle.seek(start_offset)
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    if expected_final:
+                        if final_message_from_record(record) != expected_final:
+                            continue
+                    elif event_type:
+                        payload = (
+                            record.get("payload")
+                            if record.get("type") == "event_msg"
+                            else None
+                        )
+                        if not isinstance(payload, dict) or payload.get("type") != event_type:
+                            continue
+                    else:
+                        continue
+                    latest = session_record_event_id(path, line_start, record)
+            return latest
+        except OSError as exc:
+            log_event(
+                "session-event",
+                f"failed to identify terminal event thread={thread_id}: {exc}",
+                level="WARNING",
+            )
+            return ""
+
+    def _wait_for_rollout_event_id(
+        self,
+        thread_id: str,
+        checkpoint: tuple[Optional[Path], int],
+        *,
+        final_message: str = "",
+        event_type: str = "",
+        timeout_seconds: float = 1.0,
+    ) -> str:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            event_id = self._latest_rollout_event_id(
+                thread_id,
+                checkpoint,
+                final_message=final_message,
+                event_type=event_type,
+            )
+            if event_id or time.monotonic() >= deadline:
+                return event_id
+            time.sleep(0.05)
 
     def _run_job(
         self,
+        job_id: str,
         event: Dict[str, Any],
         action: str,
         target_thread_id: str,
         workdir: Path,
         prompt: str,
         image_paths: List[Path],
-    ) -> str:
+    ) -> JobRunResult:
         result_thread_id = target_thread_id
+        checkpoint = (
+            self._rollout_checkpoint(target_thread_id)
+            if action != "new"
+            else (None, 0)
+        )
+        on_started = lambda process_id: self._on_job_started(
+            job_id,
+            event,
+            action,
+            process_id,
+        )
+        on_diagnostic = lambda line: self._on_codex_diagnostic(job_id, event, line)
         if action == "new":
             log_event(
                 "codex",
                 f"new cwd={workdir} chars={len(prompt)} images={len(image_paths)}",
             )
             code, new_thread_id, final, stderr = self.runner.run_new(
-                prompt, workdir, image_paths
+                prompt,
+                workdir,
+                image_paths,
+                on_started=on_started,
+                on_diagnostic=on_diagnostic,
             )
             if new_thread_id:
                 result_thread_id = new_thread_id
@@ -733,11 +1721,13 @@ class BridgeService:
                 self._safe_send(
                     event["openid"],
                     f"已新建并切换任务：{title}\n编号：{new_thread_id}",
+                    dedupe_key=f"job:{job_id}:created",
                 )
             elif code == 0:
                 self._safe_send(
                     event["openid"],
                     "任务已执行，但没有解析到新任务编号，因此未切换当前任务。",
+                    dedupe_key=f"job:{job_id}:missing-thread-id",
                 )
         else:
             log_event(
@@ -746,29 +1736,113 @@ class BridgeService:
                 f"images={len(image_paths)}",
             )
             code, final, stderr = self.runner.run(
-                prompt, target_thread_id, workdir, image_paths
+                prompt,
+                target_thread_id,
+                workdir,
+                image_paths,
+                on_started=on_started,
+                on_diagnostic=on_diagnostic,
             )
         if code != 0:
-            if code == -15:
-                detail = "Codex 子进程收到终止信号。"
-            else:
+            event_id = self._wait_for_rollout_event_id(
+                result_thread_id,
+                checkpoint,
+                event_type="turn_aborted",
+            )
+            reason = self.runner.termination_reason()
+            if reason == "timed_out":
+                status = "timed_out"
                 detail = summarize_codex_error(stderr)
+                heading = "Codex 任务执行超时"
+            elif reason == "cancelled":
+                status = "cancelled"
+                detail = "任务已按用户请求取消。"
+                heading = "Codex 任务已取消"
+            elif code == -15:
+                status = "failed"
+                detail = summarize_codex_error(stderr)
+                if detail == "没有错误详情":
+                    detail = "Codex 子进程收到终止信号。"
+                heading = "Codex 任务执行失败"
+            else:
+                status = "failed"
+                detail = summarize_codex_error(stderr)
+                heading = "Codex 任务执行失败"
             safe_detail, _images = qq_safe_final(detail, workdir, max_images=0)
-            self._safe_send(
-                event["openid"],
-                f"Codex 任务执行失败（退出码 {code}）：\n{safe_detail}",
+            return JobRunResult(
+                result_thread_id,
+                status,
+                detail,
+                f"{heading}（退出码 {code}）：\n{safe_detail}",
+                event_id=event_id,
             )
         elif not final:
-            self._safe_send(
-                event["openid"],
-                "Codex 任务已结束，但未解析到最终文本。发送 /recent 查看会话记录。",
+            detail = "Codex 任务已结束，但未解析到最终文本。"
+            event_id = self._wait_for_rollout_event_id(
+                result_thread_id,
+                checkpoint,
+                event_type="turn_aborted",
             )
-        return result_thread_id
+            return JobRunResult(
+                result_thread_id,
+                "failed",
+                detail,
+                f"{detail}发送 /recent 查看会话记录。",
+                event_id=event_id,
+            )
+        event_id = self._wait_for_rollout_event_id(
+            result_thread_id,
+            checkpoint,
+            final_message=final,
+        )
+        if not event_id:
+            detail = "Codex 已返回结果，但 Bridge 无法在本地会话中确认对应的终态记录。"
+            safe_final, _images = qq_safe_final(final, workdir, max_images=0)
+            return JobRunResult(
+                result_thread_id,
+                "interrupted",
+                detail,
+                f"{detail}\n为避免重复通知，本任务未标记为成功。\n\nCodex 返回：\n{safe_final}",
+            )
+        return JobRunResult(
+            result_thread_id,
+            "succeeded",
+            final_message=final,
+            event_id=event_id,
+        )
 
     def _on_final(self, thread: ThreadInfo, message: str) -> None:
+        self._enqueue_final_notification(thread, message)
+
+    def _on_final_event(self, thread: ThreadInfo, message: str, event_id: str) -> None:
+        self._enqueue_final_notification(thread, message, event_id)
+
+    def _enqueue_final_notification(
+        self,
+        thread: ThreadInfo,
+        message: str,
+        event_id: str = "",
+    ) -> None:
         openid = self._current_openid()
         if not openid:
             return
+        notification, keyboard, images = self._prepare_final_notification(thread, message)
+        dedupe_key = f"session-final:{event_id}" if event_id else ""
+        if not self._safe_send(
+            openid,
+            notification,
+            keyboard=keyboard,
+            dedupe_key=dedupe_key,
+        ):
+            raise RuntimeError("无法将 Codex 最终结果写入通知队列")
+        if not self._safe_send_images(openid, images, dedupe_key=dedupe_key):
+            raise RuntimeError("无法将 Codex 结果图片写入通知队列")
+
+    def _prepare_final_notification(
+        self,
+        thread: ThreadInfo,
+        message: str,
+    ) -> tuple[str, Dict[str, Any], List[Path]]:
         text, images = qq_safe_final(
             message,
             thread.workdir,
@@ -793,8 +1867,53 @@ class BridgeService:
                 [("任务列表", "/threads", 0), ("当前任务", "/current", 0)],
             ]
         )
-        self._safe_send(openid, notification, keyboard=keyboard)
-        self._safe_send_images(openid, images)
+        return notification, keyboard, images
+
+    def _final_outbox_specs(
+        self,
+        openid: str,
+        thread: ThreadInfo,
+        message: str,
+        dedupe_key: str,
+    ) -> List[OutboxSpec]:
+        notification, keyboard, images = self._prepare_final_notification(thread, message)
+        items = self._text_outbox_specs(
+            openid,
+            notification,
+            keyboard=keyboard,
+            dedupe_key=dedupe_key,
+        )
+        image_items, complete = self._image_outbox_specs(
+            openid,
+            images,
+            dedupe_key=dedupe_key,
+        )
+        if not complete:
+            raise RuntimeError("无法持久化 Codex 结果图片通知")
+        return [*items, *image_items]
+
+    def _on_interrupted(self, thread: ThreadInfo, detail: str, event_id: str) -> None:
+        openid = self._current_openid()
+        if not openid:
+            return
+        safe_detail, _images = qq_safe_final(detail, thread.workdir, max_images=0)
+        title = self._short_title(thread.title, 60)
+        notification = "\n".join(
+            [
+                "## Codex 任务已中断",
+                "",
+                f"**任务：{title}**",
+                f"项目：{thread.project_name}",
+                "",
+                safe_detail,
+            ]
+        )
+        if not self._safe_send(
+            openid,
+            notification,
+            dedupe_key=f"session-interrupted:{event_id}",
+        ):
+            raise RuntimeError("无法将 Codex 中断事件写入通知队列")
 
 
 def check_installation(config: Config) -> int:
@@ -842,24 +1961,31 @@ def check_installation(config: Config) -> int:
 
 
 def main() -> int:
+    configure_log_file(BASE_DIR / "data" / "logs" / "bridge.jsonl")
     parser = argparse.ArgumentParser(description="Bridge Codex Desktop tasks to QQ")
     parser.add_argument("--check", action="store_true", help="validate local configuration only")
     args = parser.parse_args()
     try:
         config = Config.from_env(BASE_DIR, require_qq=True)
     except ValueError as exc:
+        log_event("bridge", f"configuration error: {exc}", level="ERROR")
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     if args.check:
         return check_installation(config)
     try:
         service = BridgeService(config)
-    except (ValueError, RuntimeError) as exc:
+    except Exception as exc:
+        log_event("bridge", f"startup failed: {exc}", level="ERROR")
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
 
     def stop_service(_signum: int, _frame: Optional[object]) -> None:
-        service.stop()
+        threading.Thread(
+            target=service.stop,
+            name="bridge-signal-stop",
+            daemon=True,
+        ).start()
 
     signal.signal(signal.SIGINT, stop_service)
     signal.signal(signal.SIGTERM, stop_service)
@@ -868,7 +1994,16 @@ def main() -> int:
         "bridge",
         f"starting thread={active.thread_id} cwd={active.workdir}",
     )
-    service.run()
+    try:
+        service.run()
+    except Exception as exc:
+        log_event(
+            "bridge",
+            f"service failed: {exc}\n{traceback.format_exc()}",
+            level="ERROR",
+        )
+        print(f"Bridge 异常退出：{exc}", file=sys.stderr)
+        return 1
     return 0
 
 

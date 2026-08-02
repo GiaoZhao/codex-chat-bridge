@@ -14,7 +14,7 @@
 - 在启用 Desktop 刷新时，QQ 发起的回合结束后通过仅监听本机的 Chrome DevTools
   Protocol 按 Thread UUID 选择目标任务并重载渲染页，使 Desktop 重新读取最新历史；
   不会重启 Codex 主进程或 app-server，也不修改 Codex 数据库。
-- 当前任务执行中收到的新消息会排队，避免同时写入同一个会话。
+- QQ 消息会先持久化再排队；当前任务执行中收到的新消息不会同时写入同一个会话。
 - 首次使用一次性绑定码，绑定后只接受该 QQ `openid`。
 
 > 当前实际可用渠道仅为 QQ。macOS 已完成端到端验证；Windows 已加入核心桥接兼容实现，
@@ -24,8 +24,11 @@
 ## 演进方向
 
 - 抽离统一渠道接口，逐步接入更多聊天平台。
-- 增加 Web 管理界面，用于会话、渠道、权限和通知规则配置。
+- 增加 Windows/macOS 轻量控制客户端，用于 Bridge 配置、启停、状态监控和持久日志。
 - 在 Codex 提供稳定的外部控制接口后，替换当前 CLI resume 与 Desktop 刷新方案。
+
+已确认的客户端产品边界、电源管理行为和验收标准见
+[Desktop Client Requirements](docs/desktop-client-requirements.md)。
 
 ## 当前实现边界
 
@@ -47,6 +50,16 @@ renderer reload；Windows 的 Desktop 刷新尚未验证，因此默认关闭。
 QQ Gateway 建立 READY 会话时的“Bridge 已上线”消息默认关闭，避免网络重连产生重复
 通知。如需启动提醒，将 `.env` 中的 `QQ_NOTIFY_ON_READY` 设为 `1`；同一 Bridge 进程
 即使重连多次也只发送一次。
+
+QQ 发起任务时会依次区分“已接收并保存”“等待已有任务”和“Codex 子进程已启动”；只有
+成功创建 Codex 子进程后才会发送第三种回执。任务队列和待发送通知保存在
+`data/bridge.sqlite3`，Bridge 重启后会恢复尚未派发的任务和未发送通知。为避免重复执行，
+已进入派发或运行阶段但被异常中断的任务不会自动重跑，而会在 QQ 中提示人工核对。
+`data/bridge.lock` 会阻止同一目录同时启动两个 Bridge 实例。
+
+运行日志写入 `data/logs/bridge.jsonl`，单文件达到 2MB 后轮转，保留 5 份历史文件。
+回执语义、重启恢复边界、错误通知能力和取日志步骤见
+[Reliability and Troubleshooting](docs/reliability.md)。
 
 全部任务通知使用 Codex 只读任务索引取得可见根任务，并为每个 rollout 文件保存独立
 字节游标。首次启用时只建立当前文件尾部基线，不补发历史；之后桥接短暂重启期间新增

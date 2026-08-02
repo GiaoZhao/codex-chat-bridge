@@ -384,6 +384,7 @@ class QQGatewayClient:
         api: QQApi,
         on_event: Callable[[Dict[str, Any]], None],
         on_ready: Callable[[], None],
+        on_state: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         if websocket is None:
             raise RuntimeError("缺少 websocket-client，请先运行 scripts/setup.sh")
@@ -391,6 +392,7 @@ class QQGatewayClient:
         self.api = api
         self.on_event = on_event
         self.on_ready = on_ready
+        self.on_state = on_state
         self.stop_event = threading.Event()
         self.ws = None
         self.latest_seq: Optional[int] = None
@@ -398,6 +400,19 @@ class QQGatewayClient:
         self._send_lock = threading.Lock()
         self._heartbeat_stop: Optional[threading.Event] = None
         self._seen: Dict[str, float] = {}
+        self._state = "stopped"
+        self._state_lock = threading.Lock()
+
+    def _emit_state(self, state: str, detail: str = "") -> None:
+        with self._state_lock:
+            if state == self._state and not detail:
+                return
+            self._state = state
+        if self.on_state is not None:
+            try:
+                self.on_state(state, detail)
+            except Exception as exc:
+                log_event("qq-gateway", f"state callback failed: {exc}", level="ERROR")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -405,12 +420,14 @@ class QQGatewayClient:
         with self._send_lock:
             if self.ws:
                 self.ws.close()
+        self._emit_state("stopped")
 
     def run_forever(self) -> None:
         while not self.stop_event.is_set():
             try:
+                self._emit_state("connecting")
                 url = self.api.gateway_url()
-                log_event("qq-gateway", f"connecting {url}")
+                log_event("qq-gateway", "connecting")
                 self.ws = websocket.WebSocketApp(
                     url,
                     on_message=self._on_message,
@@ -419,7 +436,8 @@ class QQGatewayClient:
                 )
                 self.ws.run_forever(ping_interval=0)
             except Exception as exc:
-                log_event("qq-gateway", str(exc))
+                log_event("qq-gateway", str(exc), level="ERROR")
+                self._emit_state("error", str(exc))
             if not self.stop_event.wait(5):
                 log_event("qq-gateway", "reconnecting")
 
@@ -457,7 +475,8 @@ class QQGatewayClient:
                 try:
                     self._send({"op": 1, "d": self.latest_seq})
                 except Exception as exc:
-                    log_event("qq-heartbeat", str(exc))
+                    log_event("qq-heartbeat", str(exc), level="ERROR")
+                    self._emit_state("error", str(exc))
                     return
 
         threading.Thread(target=loop, name="qq-heartbeat", daemon=True).start()
@@ -502,18 +521,22 @@ class QQGatewayClient:
             if event_type == "READY":
                 data = payload.get("d") or {}
                 self.session_id = str(data.get("session_id") or "")
-                log_event("qq-gateway", f"READY session={self.session_id[:8]}")
+                log_event("qq-gateway", "READY")
+                self._emit_state("ready")
                 self.on_ready()
                 return
             event = extract_c2c_event(payload)
             if event and self._dedup(event["message_id"]):
                 self.on_event(event)
         except Exception as exc:
-            log_event("qq-gateway", f"event error: {exc}")
+            log_event("qq-gateway", f"event error: {exc}", level="ERROR")
 
     def _on_error(self, _ws: Any, error: Any) -> None:
-        log_event("qq-gateway", f"websocket error: {error}")
+        log_event("qq-gateway", f"websocket error: {error}", level="ERROR")
+        self._emit_state("error", str(error))
 
     def _on_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self._stop_heartbeat()
         log_event("qq-gateway", f"closed code={code} reason={reason}")
+        if not self.stop_event.is_set():
+            self._emit_state("disconnected", f"code={code} reason={reason}")

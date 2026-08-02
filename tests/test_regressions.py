@@ -116,17 +116,21 @@ class BridgeServiceRegressionTests(unittest.TestCase):
     def test_gateway_ready_notification_is_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             service = self._service(Path(raw_dir), notify_on_ready=False)
-
-            service._on_gateway_ready()
+            try:
+                service._on_gateway_ready()
+            finally:
+                service.instance_lock.release()
 
         service._safe_send.assert_not_called()
 
     def test_enabled_gateway_ready_notification_is_sent_only_once(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             service = self._service(Path(raw_dir), notify_on_ready=True)
-
-            service._on_gateway_ready()
-            service._on_gateway_ready()
+            try:
+                service._on_gateway_ready()
+                service._on_gateway_ready()
+            finally:
+                service.instance_lock.release()
 
         service._safe_send.assert_called_once()
 
