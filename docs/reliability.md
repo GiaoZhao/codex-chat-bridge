@@ -6,7 +6,8 @@ QQ 发起的任务会经过以下可区分阶段：
 
 1. `已接收并保存`：消息和附件已写入本机持久队列，但 Codex 尚未启动。
 2. `已保存并进入等待队列`：检测到已有 Codex 任务，当前任务继续等待。
-3. `Codex 子进程已启动`：本机已成功创建 Codex CLI 子进程，任务开始执行。
+3. `Codex 共享回合已启动` 或 `Codex 子进程已启动`：shared daemon 已接受回合，或本机
+   已成功创建 Codex CLI 子进程，任务开始执行。
 
 最终还会发送完成、失败、超时或取消结果。“已接收”不再表示 Codex 已经开始执行。
 
@@ -54,17 +55,27 @@ Markdown 优先按段落和完整行切分，不切断内联链接、自动链�
 超过单片限制的代码块也会明确降级为分段文本。达到最大分片数后仍会截断，并提示回
 Codex Desktop 查看完整结果。
 
-当前版本不自动操作 Codex Desktop 页面。外部 CLI 回合会写入原生会话，但 Desktop 不订阅
-这类回合，当前页面可能不会立即更新。renderer reload 曾造成页面卡住；现有私有缓存动作
-又可能中断新回合，或在窗口不处于前台时清理后不恢复。因此自动 Desktop 同步现在失败
-关闭：不连接调试端口、不切换页面、不清理缓存、不重载 renderer。预留开关即使设为 `1`
-也只记录无法安全同步，直到存在可验证、非破坏性的接口。
+当前版本不自动操作 Codex Desktop 页面。macOS 的 `app-server` 传输让 Bridge 和 Desktop
+连接同一个 standalone Codex shared daemon，QQ 回合可通过官方协议事件实时显示，`/new`
+标题通过 `thread/name/set` 显式设置。Bridge 不连接调试端口、不切换页面、不清理缓存、
+不重载 renderer；预留开关即使设为 `1` 也不执行 Desktop 操作。
+
+`CODEX_TRANSPORT=auto` 在 control socket 存在时选择 `app-server`，否则选择 `exec`。
+socket 存在但握手失败会阻止 Bridge 启动，防止以未同步状态继续运行。强制模式分别为
+`app-server` 和 `exec`。Windows 当前固定使用 `exec`，外部 CLI 回合虽然写入原生会话，
+Desktop 当前页面仍可能不会立即更新。
+
+shared daemon 是实验能力。当前 macOS 启动方式依赖 `codex app-server daemon start` 和
+`launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1`；电脑重启或重新登录后不能假定二者
+仍然生效，应重新启动 daemon、完整重启 Desktop，并用 `scripts/run.sh --check` 确认输出
+`Transport: app-server`。审批请求不会由 Bridge 自动同意；QQ 只发送提示，实际决定在
+Desktop 对应任务完成。
 
 ## 故障通知边界
 
-Bridge 会识别 Codex CLI 输出中的网络连接、上游 API、鉴权和限流错误，并按任务和错误
-类别去重发送提示；Codex 非零退出、超时、用户取消以及会话中的 `turn_aborted` 也会主动
-通知。
+Bridge 会识别 Codex 输出中的网络连接、上游 API、鉴权、限流和 Desktop 审批等待，并按
+任务和错误类别去重发送提示；Codex 非零退出、失败回合、外部中断、超时、用户取消以及
+会话中的 `turn_aborted` 也会主动通知。
 
 以下情况无法立即通过同一个 QQ 通道告警：
 

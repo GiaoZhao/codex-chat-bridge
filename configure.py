@@ -101,6 +101,8 @@ def main() -> int:
         "CODEX_THREAD_ID": thread_id,
         "CODEX_WORKDIR": workdir,
         "CODEX_COMMAND": command,
+        "CODEX_TRANSPORT": "auto",
+        "CODEX_APP_SERVER_SOCKET": "~/.codex/app-server-control/app-server-control.sock",
         "CODEX_DESKTOP_REFRESH": desktop_refresh,
         "QQ_REPLY_MAX_CHARS": "1500",
         "QQ_REPLY_MAX_CHUNKS": "8",

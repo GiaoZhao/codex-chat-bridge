@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
+from codex_app_server import AppServerCodexRunner, AppServerProtocolError
 from bridge_core import (
     ActiveThread,
     CodexDesktopRefresher,
@@ -68,6 +69,55 @@ class JobDispatchUncertainError(RuntimeError):
     pass
 
 
+def select_codex_runner(config: Config, verify: bool = True) -> Any:
+    mode = str(getattr(config, "codex_transport", "exec") or "exec").lower()
+    if mode == "exec":
+        return CodexRunner(config)
+
+    socket_path = Path(
+        getattr(
+            config,
+            "codex_app_server_socket",
+            Path.home()
+            / ".codex"
+            / "app-server-control"
+            / "app-server-control.sock",
+        )
+    ).expanduser()
+    supported = sys.platform != "win32"
+    socket_exists = False
+    try:
+        socket_exists = socket_path.is_socket()
+    except OSError:
+        socket_exists = False
+
+    if supported and socket_exists:
+        runner = AppServerCodexRunner(config)
+        if verify:
+            try:
+                info = runner.probe()
+            except AppServerProtocolError as exc:
+                raise ValueError(
+                    f"Codex shared daemon socket 存在但握手失败: {exc}"
+                ) from exc
+            user_agent = str(info.get("userAgent") or "unknown")
+            log_event(
+                "codex-transport",
+                f"using app-server socket={socket_path} userAgent={user_agent}",
+            )
+            runner.probe_info = info
+        return runner
+
+    if mode == "app-server":
+        if not supported:
+            raise ValueError("Codex shared daemon 当前不支持 Windows")
+        raise ValueError(f"未找到 Codex shared daemon socket: {socket_path}")
+
+    reason = "unsupported platform" if not supported else f"socket missing: {socket_path}"
+    log_event("codex-transport", f"using exec fallback: {reason}", level="WARNING")
+    return CodexRunner(config)
+
+
 class BridgeService:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -86,7 +136,7 @@ class BridgeService:
             self.api = QQApi(config)
             self.thread_index = ThreadIndex(config.codex_state_db)
             self.active_thread = ActiveThread(config, self.state, self.thread_index)
-            self.runner = CodexRunner(config)
+            self.runner = select_codex_runner(config)
             self.desktop_refresher = CodexDesktopRefresher(
                 config.codex_desktop_refresh,
                 config.codex_desktop_cdp_url,
@@ -763,6 +813,7 @@ class BridgeService:
                 f"标题：{self._short_title(active.title, 60)}",
                 f"任务：{active.thread_id}",
                 f"Codex：{'执行中' if busy or self.runner.running() else '空闲'}",
+                f"传输：{getattr(self.runner, 'transport_name', 'exec')}",
                 f"Worker 阶段：{worker_stage}",
                 f"最近任务状态：{latest_job.status if latest_job else '无'}",
                 f"持久任务：{queue_size}",
@@ -1508,13 +1559,22 @@ class BridgeService:
         job_id: str,
         event: Dict[str, Any],
         action: str,
-        process_id: int,
+        process_id: Optional[int],
     ) -> None:
-        message = (
-            "Codex 子进程已启动，正在创建新任务。"
-            if action == "new"
-            else "Codex 子进程已启动，正在执行当前任务。"
-        )
+        runner = getattr(self, "runner", None)
+        shared_daemon = getattr(runner, "transport_name", "exec") == "app-server"
+        if shared_daemon:
+            message = (
+                "Codex 共享回合已启动，正在创建新任务。"
+                if action == "new"
+                else "Codex 共享回合已启动，正在执行当前任务。"
+            )
+        else:
+            message = (
+                "Codex 子进程已启动，正在创建新任务。"
+                if action == "new"
+                else "Codex 子进程已启动，正在执行当前任务。"
+            )
         try:
             self._set_job_status_with_notification(
                 job_id,
@@ -1588,6 +1648,12 @@ class BridgeService:
         ):
             category = "network"
             message = "Codex 报告网络连接异常，CLI 可能正在自动重试。"
+        elif any(
+            marker in lowered
+            for marker in ("desktop interaction required", "approval required")
+        ):
+            category = "approval"
+            message = "Codex 正在等待桌面端交互或审批，请打开对应任务处理。"
         if not category:
             return
         log_event(
@@ -1717,16 +1783,17 @@ class BridgeService:
                 "codex",
                 f"new cwd={workdir} chars={len(prompt)} images={len(image_paths)}",
             )
+            title = self._short_title(prompt, 80)
             code, new_thread_id, final, stderr = self.runner.run_new(
                 prompt,
                 workdir,
                 image_paths,
                 on_started=on_started,
                 on_diagnostic=on_diagnostic,
+                thread_name=title,
             )
             if new_thread_id:
                 result_thread_id = new_thread_id
-                title = self._short_title(prompt, 80)
                 self.active_thread.switch(
                     ThreadInfo(new_thread_id, title, workdir.resolve())
                 )
@@ -1770,6 +1837,10 @@ class BridgeService:
                 status = "cancelled"
                 detail = "任务已按用户请求取消。"
                 heading = "Codex 任务已取消"
+            elif reason == "interrupted":
+                status = "interrupted"
+                detail = summarize_codex_error(stderr)
+                heading = "Codex 任务已中断"
             elif code == -15:
                 status = "failed"
                 detail = summarize_codex_error(stderr)
@@ -1977,6 +2048,8 @@ class BridgeService:
 
 def check_installation(config: Config) -> int:
     errors = []
+    transport = "unknown"
+    transport_detail = ""
     state = StateStore(config.base_dir / "data" / "state.json").load()
     stored_id = str(state.get("active_thread_id") or "")
     thread_id = stored_id if stored_id else config.codex_thread_id
@@ -1989,6 +2062,14 @@ def check_installation(config: Config) -> int:
         errors.append(f"Codex 任务索引读取失败: {exc}")
     if websocket is None:
         errors.append("缺少 Python 依赖 websocket-client")
+    try:
+        runner = select_codex_runner(config)
+        transport = getattr(runner, "transport_name", "exec")
+        probe_info = getattr(runner, "probe_info", {})
+        if isinstance(probe_info, dict):
+            transport_detail = str(probe_info.get("userAgent") or "")
+    except Exception as exc:
+        errors.append(f"Codex transport 检查失败: {exc}")
     try:
         completed = subprocess.run(
             [*config.codex_command, "--version"],
@@ -2006,6 +2087,10 @@ def check_installation(config: Config) -> int:
         errors.append(f"Codex 命令检查失败: {exc}")
         version = "unknown"
     print(f"Codex: {version}")
+    print(
+        f"Transport: {transport}"
+        + (f" ({transport_detail})" if transport_detail else "")
+    )
     print(f"Thread: {thread_id}")
     print(f"Session: {path or 'not found'}")
     print(f"State DB: {config.codex_state_db}")

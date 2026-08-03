@@ -177,6 +177,8 @@ class Config:
     codex_thread_id: str
     codex_workdir: Path
     codex_command: Tuple[str, ...]
+    codex_transport: str
+    codex_app_server_socket: Path
     codex_sessions_dir: Path
     codex_state_db: Path
     codex_turn_timeout: int
@@ -197,6 +199,18 @@ class Config:
         ).expanduser()
         command_raw = os.getenv("CODEX_COMMAND", "codex").strip() or "codex"
         command = resolve_command(parse_command(command_raw))
+        transport = os.getenv("CODEX_TRANSPORT", "auto").strip().lower() or "auto"
+        app_server_socket = Path(
+            os.getenv(
+                "CODEX_APP_SERVER_SOCKET",
+                str(
+                    Path.home()
+                    / ".codex"
+                    / "app-server-control"
+                    / "app-server-control.sock"
+                ),
+            )
+        ).expanduser()
         desktop_cdp_url = os.getenv(
             "CODEX_DESKTOP_CDP_URL", "http://127.0.0.1:9229"
         ).strip().rstrip("/")
@@ -218,6 +232,8 @@ class Config:
             errors.append("CODEX_COMMAND 不能为空")
         elif shutil.which(command[0]) is None and not Path(command[0]).expanduser().is_file():
             errors.append(f"找不到 Codex 命令: {command[0]}")
+        if transport not in {"auto", "app-server", "exec"}:
+            errors.append("CODEX_TRANSPORT 只允许 auto、app-server 或 exec")
         parsed_cdp_url = urlparse(desktop_cdp_url)
         if (
             parsed_cdp_url.scheme != "http"
@@ -255,6 +271,8 @@ class Config:
             codex_thread_id=thread_id,
             codex_workdir=workdir.resolve(),
             codex_command=command,
+            codex_transport=transport,
+            codex_app_server_socket=app_server_socket.resolve(),
             codex_sessions_dir=sessions_dir.resolve(),
             codex_state_db=state_db.resolve(),
             codex_turn_timeout=env_int("CODEX_TURN_TIMEOUT", 7200, 60, 21600),
@@ -891,6 +909,8 @@ def summarize_codex_error(stderr: str, max_chars: int = 1000) -> str:
 
 
 class CodexRunner:
+    transport_name = "exec"
+
     def __init__(self, config: Config) -> None:
         self.config = config
         self._lock = threading.Lock()
@@ -1096,7 +1116,9 @@ class CodexRunner:
         image_paths: Optional[List[Path]] = None,
         on_started: Optional[Callable[[int], None]] = None,
         on_diagnostic: Optional[Callable[[str], None]] = None,
+        thread_name: Optional[str] = None,
     ) -> Tuple[int, Optional[str], Optional[str], str]:
+        del thread_name
         command = [
             *self.config.codex_command,
             "exec",
