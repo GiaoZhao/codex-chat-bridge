@@ -138,11 +138,11 @@ class BridgeService:
                 on_state=self._on_gateway_state,
             )
             self._send_lock = threading.Lock()
-            recovered_leases = self.store.recover_outbox_leases()
+            discarded_outbox = self.store.discard_pending_outbox()
             self._cleanup_unreferenced_outbox_images()
             self._restore_persisted_jobs()
-            if recovered_leases:
-                log_event("recovery", f"outbox_leases={recovered_leases}")
+            if discarded_outbox:
+                log_event("recovery", f"discarded_outbox={discarded_outbox}")
         except BaseException:
             self.instance_lock.release()
             raise
@@ -388,12 +388,13 @@ class BridgeService:
         if msg_id:
             max_chunks = min(max_chunks, max(1, 5 - start_seq))
         chunks = split_message(text, self.config.qq_reply_chars, max_chunks)
+        last_seq = start_seq + len(chunks) - 1
         for index, chunk in enumerate(chunks, start_seq):
             self._send_chunk(
                 openid,
                 chunk,
                 msg_id=msg_id,
-                keyboard=keyboard if index == start_seq else None,
+                keyboard=keyboard if index == last_seq else None,
                 msg_seq=index,
             )
             if len(chunks) > 1:
@@ -460,6 +461,7 @@ class BridgeService:
             group_key = f"reply:{msg_id}:{fingerprint}"
         else:
             group_key = f"notice:{uuid.uuid4().hex}"
+        last_seq = start_seq + len(chunks) - 1
         return [
             OutboxSpec(
                 f"{group_key}:chunk:{index}",
@@ -469,7 +471,7 @@ class BridgeService:
                     "text": chunk,
                     "msg_id": msg_id,
                     "msg_seq": index,
-                    "keyboard": keyboard if index == start_seq else None,
+                    "keyboard": keyboard if index == last_seq else None,
                 },
                 group_key,
             )
@@ -1219,12 +1221,20 @@ class BridgeService:
             known_idle_session_size=size,
         )
 
-    def _refresh_desktop(self, thread_id: str) -> None:
+    def _refresh_desktop(self, thread_id: str, workdir: Optional[Path] = None) -> None:
         try:
-            if self.desktop_refresher.refresh(thread_id):
-                log_event("desktop", f"refreshed thread={thread_id}")
+            if self.desktop_refresher.refresh(thread_id, workdir):
+                detail = getattr(self.desktop_refresher, "last_detail", "")
+                suffix = f" detail={detail}" if isinstance(detail, str) and detail else ""
+                log_event("desktop", f"refreshed thread={thread_id}{suffix}")
             elif self.config.codex_desktop_refresh:
-                log_event("desktop", f"refresh skipped or failed thread={thread_id}")
+                detail = getattr(self.desktop_refresher, "last_detail", "")
+                suffix = f" detail={detail}" if isinstance(detail, str) and detail else ""
+                log_event(
+                    "desktop",
+                    f"refresh skipped or failed thread={thread_id}{suffix}",
+                    level="WARNING",
+                )
         except Exception:
             log_event(
                 "desktop",
@@ -1305,6 +1315,7 @@ class BridgeService:
                 image_paths = [Path(str(value)) for value in event.get("image_paths") or []]
                 if image_paths and not prompt:
                     prompt = "请查看我发送的图片，并根据图片内容继续处理。"
+                    event["content"] = prompt
                 missing = [path.name for path in image_paths if not path.is_file()]
                 if missing:
                     raise FileNotFoundError(f"已保存的输入图片不存在: {', '.join(missing)}")
@@ -1342,7 +1353,7 @@ class BridgeService:
                 if action == "new":
                     refreshed_thread_id = self.active_thread.snapshot().thread_id
                 self._mark_thread_idle(refreshed_thread_id)
-                self._refresh_desktop(refreshed_thread_id)
+                self._refresh_desktop(refreshed_thread_id, workdir)
                 log_event(
                     "worker",
                     f"finished job={job_id} status={result.status} "
@@ -1446,6 +1457,7 @@ class BridgeService:
                     thread,
                     result.final_message,
                     dedupe_key,
+                    question=str(job.payload.get("content") or "").strip(),
                 )
                 if not items:
                     raise RuntimeError("成功任务通知缺少 QQ 收件人")
@@ -1812,36 +1824,57 @@ class BridgeService:
         )
 
     def _on_final(self, thread: ThreadInfo, message: str) -> None:
-        self._enqueue_final_notification(thread, message)
+        question = ""
+        sessions_dir = getattr(self.config, "codex_sessions_dir", None)
+        path = thread.rollout_path
+        if path is None and sessions_dir is not None:
+            path = find_session_file(sessions_dir, thread.thread_id)
+        turn = latest_complete_turn(path) if path else None
+        if turn and turn[1] == message:
+            question = turn[0]
+        self._enqueue_final_notification(thread, message, question=question)
 
-    def _on_final_event(self, thread: ThreadInfo, message: str, event_id: str) -> None:
-        self._enqueue_final_notification(thread, message, event_id)
+    def _on_final_event(
+        self,
+        thread: ThreadInfo,
+        message: str,
+        event_id: str,
+        question: str = "",
+    ) -> None:
+        self._enqueue_final_notification(thread, message, event_id, question)
 
     def _enqueue_final_notification(
         self,
         thread: ThreadInfo,
         message: str,
         event_id: str = "",
+        question: str = "",
     ) -> None:
         openid = self._current_openid()
         if not openid:
             return
-        notification, keyboard, images = self._prepare_final_notification(thread, message)
         dedupe_key = f"session-final:{event_id}" if event_id else ""
-        if not self._safe_send(
-            openid,
-            notification,
-            keyboard=keyboard,
-            dedupe_key=dedupe_key,
-        ):
-            raise RuntimeError("无法将 Codex 最终结果写入通知队列")
-        if not self._safe_send_images(openid, images, dedupe_key=dedupe_key):
-            raise RuntimeError("无法将 Codex 结果图片写入通知队列")
+        with self._outbox_image_lock:
+            try:
+                items = self._final_outbox_specs(
+                    openid,
+                    thread,
+                    message,
+                    dedupe_key,
+                    question,
+                )
+                if not items:
+                    raise RuntimeError("Codex 最终结果通知缺少 QQ 收件人")
+                self.store.enqueue_outbox_batch(items)
+            finally:
+                self._cleanup_unreferenced_outbox_images()
+        self.outbox_wakeup.set()
 
     def _prepare_final_notification(
         self,
         thread: ThreadInfo,
         message: str,
+        question: str = "",
     ) -> tuple[str, Dict[str, Any], List[Path]]:
         text, images = qq_safe_final(
             message,
@@ -1850,17 +1883,38 @@ class BridgeService:
         )
         title = self._short_title(thread.title, 60)
         body = text or "Codex 已返回图片。"
-        notification = "\n".join(
-            [
-                "## Codex 任务已回复",
-                "",
-                f"**任务：{title}**",
-                f"项目：{thread.project_name}",
-                f"编号：`{thread.thread_id}`",
-                "",
-                body,
-            ]
-        )
+        safe_question = ""
+        if question.strip():
+            safe_question, _question_images = qq_safe_final(
+                question,
+                thread.workdir,
+                max_images=0,
+            )
+        normalized_question = " ".join(safe_question.split())
+        if len(normalized_question) > 400:
+            normalized_question = normalized_question[:399].rstrip() + "…"
+        escaped_question = normalized_question.replace("\\", "\\\\")
+        for marker in ("`", "*", "_", "[", "]", "#", "|", ">"):
+            escaped_question = escaped_question.replace(marker, f"\\{marker}")
+        lines = [
+            "## Codex 任务已回复",
+            "",
+            f"**任务：{title}**",
+            f"项目：{thread.project_name}",
+            f"编号：`{thread.thread_id}`",
+        ]
+        if escaped_question:
+            lines.extend(
+                [
+                    "",
+                    "### 本轮问题",
+                    f"> {escaped_question}",
+                    "",
+                    "### Codex 回复",
+                ]
+            )
+        lines.extend(["", body])
+        notification = "\n".join(lines)
         keyboard = self._keyboard(
             [
                 [("切换到此任务", f"/use {thread.thread_id}", 1)],
@@ -1875,8 +1929,13 @@ class BridgeService:
         thread: ThreadInfo,
         message: str,
         dedupe_key: str,
+        question: str = "",
     ) -> List[OutboxSpec]:
-        notification, keyboard, images = self._prepare_final_notification(thread, message)
+        notification, keyboard, images = self._prepare_final_notification(
+            thread,
+            message,
+            question,
+        )
         items = self._text_outbox_specs(
             openid,
             notification,

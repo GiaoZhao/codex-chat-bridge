@@ -107,19 +107,59 @@ class BridgeStoreTests(unittest.TestCase):
             store.mark_outbox_sent(retried.outbox_id)
             self.assertEqual(store.pending_outbox_count(), 0)
 
-    def test_new_store_releases_an_abandoned_outbox_lease(self) -> None:
+    def test_existing_outbox_group_rejects_an_entire_alternate_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            store = BridgeStore(Path(raw_dir) / "bridge.sqlite3")
+            first = store.enqueue_outbox_batch(
+                [
+                    OutboxSpec("event:chunk:1", {"text": "first one"}, "event"),
+                    OutboxSpec("event:chunk:2", {"text": "first two"}, "event"),
+                ]
+            )
+            alternate = store.enqueue_outbox_batch(
+                [
+                    OutboxSpec("event:chunk:1", {"text": "changed one"}, "event"),
+                    OutboxSpec("event:chunk:2", {"text": "changed two"}, "event"),
+                    OutboxSpec("event:chunk:3", {"text": "changed three"}, "event"),
+                ]
+            )
+
+            self.assertTrue(all(created for _outbox_id, created in first))
+            self.assertTrue(all(not created for _outbox_id, created in alternate))
+            first_item = store.claim_due_outbox()
+            self.assertEqual(first_item.payload["text"], "first one")
+            store.mark_outbox_sent(first_item.outbox_id)
+            second_item = store.claim_due_outbox()
+            self.assertEqual(second_item.payload["text"], "first two")
+            store.mark_outbox_sent(second_item.outbox_id)
+            self.assertIsNone(store.claim_due_outbox())
+
+    def test_restart_discards_pending_and_abandoned_outbox_items(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             path = Path(raw_dir) / "bridge.sqlite3"
             first = BridgeStore(path)
-            first.enqueue_outbox("lease", {"kind": "text"})
+            first.enqueue_outbox_batch(
+                [
+                    OutboxSpec("lease", {"kind": "text"}, "message"),
+                    OutboxSpec("pending", {"kind": "text"}, "message"),
+                ]
+            )
             claimed = first.claim_due_outbox(lease_seconds=3600)
             self.assertIsNotNone(claimed)
 
             restarted = BridgeStore(path)
-            self.assertEqual(restarted.recover_outbox_leases(), 1)
-            reclaimed = restarted.claim_due_outbox()
-            self.assertIsNotNone(reclaimed)
-            self.assertEqual(reclaimed.dedupe_key, "lease")
+            self.assertEqual(restarted.discard_pending_outbox(), 2)
+            self.assertEqual(restarted.pending_outbox_count(), 0)
+            self.assertIsNone(restarted.claim_due_outbox())
+
+            restarted.enqueue_outbox(
+                "current-process",
+                {"kind": "text"},
+                "current-message",
+            )
+            current = restarted.claim_due_outbox()
+            self.assertIsNotNone(current)
+            self.assertEqual(current.dedupe_key, "current-process")
 
     def test_later_group_item_waits_for_an_earlier_retry(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -360,7 +400,11 @@ class TerminalNotificationTests(unittest.TestCase):
             with self.subTest(monitor_first=monitor_first), tempfile.TemporaryDirectory() as raw_dir:
                 root = Path(raw_dir)
                 service, info = self._service(root)
-                payload = {"openid": "user", "workdir": str(root)}
+                payload = {
+                    "openid": "user",
+                    "workdir": str(root),
+                    "content": "current question",
+                }
                 job, _created = service.store.enqueue_job("message", payload)
                 service.store.set_job_status(job.job_id, "running")
                 result = JobRunResult(
@@ -371,16 +415,35 @@ class TerminalNotificationTests(unittest.TestCase):
                 )
 
                 if monitor_first:
-                    service._on_final_event(info, "done", "event-1")
+                    service._on_final_event(
+                        info,
+                        "done",
+                        "event-1",
+                        "monitor question",
+                    )
                 service._persist_job_result(job, result)
                 if not monitor_first:
-                    service._on_final_event(info, "done", "event-1")
+                    service._on_final_event(
+                        info,
+                        "done",
+                        "event-1",
+                        "monitor question",
+                    )
 
                 self.assertEqual(service.store.get_job(job.job_id).status, "succeeded")
                 self.assertEqual(service.store.pending_outbox_count(), 1)
                 reopened = BridgeStore(root / "data" / "bridge.sqlite3")
                 notice = reopened.claim_due_outbox()
                 self.assertIn("done", notice.payload["text"])
+                self.assertIn("本轮问题", notice.payload["text"])
+                winning_question = (
+                    "monitor question" if monitor_first else "current question"
+                )
+                losing_question = (
+                    "current question" if monitor_first else "monitor question"
+                )
+                self.assertIn(winning_question, notice.payload["text"])
+                self.assertNotIn(losing_question, notice.payload["text"])
                 self.assertEqual(notice.dedupe_key, "session-final:event-1:chunk:1")
 
     def test_success_notification_serialization_failure_rolls_back_state(self) -> None:
@@ -552,6 +615,23 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertNotIn("正在继续", outbox.payload["text"])
             self.assertNotIn("已启动", outbox.payload["text"])
 
+    def test_keyboard_is_attached_only_to_the_last_markdown_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            service = self._service(Path(raw_dir))
+            service.config.qq_reply_chars = 80
+            keyboard = {"content": {"rows": []}}
+
+            items = service._text_outbox_specs(
+                "user",
+                "第一段 " + "x" * 220,
+                keyboard=keyboard,
+                dedupe_key="long-message",
+            )
+
+            self.assertGreater(len(items), 1)
+            self.assertTrue(all(item.payload["keyboard"] is None for item in items[:-1]))
+            self.assertEqual(items[-1].payload["keyboard"], keyboard)
+
     def test_started_notification_requires_running_transition(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -590,6 +670,36 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.store.pending_outbox_count(), 1)
             outbox = service.store.claim_due_outbox()
             self.assertIn("网络连接异常", outbox.payload["text"])
+
+    def test_plugin_sync_warnings_do_not_emit_auth_or_network_notifications(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            service = self._service(Path(raw_dir))
+            event = {"openid": "user"}
+
+            service._on_codex_diagnostic(
+                "job-1",
+                event,
+                "WARN codex_core_plugins::remote::remote_installed_plugin_sync: "
+                "chatgpt authentication required for remote plugin catalog; "
+                "api key auth is not supported",
+            )
+            service._on_codex_diagnostic(
+                "job-1",
+                event,
+                "WARN codex_core_plugins::startup_sync: git sync failed: "
+                "Failed to connect to github.com",
+            )
+
+            self.assertEqual(service.store.pending_outbox_count(), 0)
+
+            service._on_codex_diagnostic(
+                "job-1",
+                event,
+                "ERROR codex_api::client: invalid API key; HTTP 401",
+            )
+            self.assertEqual(service.store.pending_outbox_count(), 1)
+            outbox = service.store.claim_due_outbox()
+            self.assertIn("登录或鉴权异常", outbox.payload["text"])
 
     def test_openid_is_redacted_from_encoded_api_errors(self) -> None:
         openid = "user/id+secret"
@@ -643,6 +753,60 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertEqual(persisted.status, "queued")
             service._run_job.assert_not_called()
             service._cleanup_job_attachments.assert_not_called()
+
+    def test_image_only_job_uses_the_effective_prompt_in_its_final_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            image = root / "input.png"
+            image.write_bytes(b"png")
+            service = self._service(root)
+            service.config.codex_sessions_dir = root
+            service.config.codex_workdir = root
+            service.worker_busy = threading.Event()
+            service._runtime_lock = threading.Lock()
+            service.worker_stage = "idle"
+            service.current_job_id = ""
+            service.last_worker_error = ""
+            service.runner = Mock()
+            service.runner.running.return_value = False
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(THREAD_ID, "task", root)
+            service._wait_until_idle = Mock(return_value=True)
+            service._cleanup_job_attachments = Mock()
+            service._mark_thread_idle = Mock()
+            service._refresh_desktop = Mock()
+            service._run_job = Mock(
+                return_value=JobRunResult(
+                    THREAD_ID,
+                    "succeeded",
+                    final_message="done",
+                    event_id="event-1",
+                )
+            )
+            captured_question = []
+
+            def persist(job: object, _result: JobRunResult) -> bool:
+                captured_question.append(job.payload["content"])
+                service.stop_event.set()
+                return True
+
+            service._persist_job_result_with_retry = Mock(side_effect=persist)
+            payload = {
+                "openid": "user",
+                "action": "resume",
+                "thread_id": THREAD_ID,
+                "workdir": str(root),
+                "content": "",
+                "image_paths": [str(image)],
+            }
+            job, _ = service.store.enqueue_job("message-1", payload)
+            service.jobs.put_nowait(job.job_id)
+
+            service._worker_loop()
+
+            expected = "请查看我发送的图片，并根据图片内容继续处理。"
+            self.assertEqual(service._run_job.call_args.args[5], expected)
+            self.assertEqual(captured_question, [expected])
 
     def test_started_process_persistence_failure_is_uncertain(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:

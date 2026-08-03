@@ -16,12 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
-from urllib.request import urlopen
-
-try:
-    import websocket
-except ImportError:  # pragma: no cover - reported by the installation check
-    websocket = None
 
 
 THREAD_ID_RE = re.compile(
@@ -253,7 +247,7 @@ class Config:
             ),
             qq_attachment_max_images=env_int("QQ_ATTACHMENT_MAX_IMAGES", 3, 1, 5),
             qq_notify_on_ready=env_bool("QQ_NOTIFY_ON_READY", False),
-            codex_desktop_refresh=env_bool("CODEX_DESKTOP_REFRESH", os.name != "nt"),
+            codex_desktop_refresh=env_bool("CODEX_DESKTOP_REFRESH", False),
             codex_desktop_cdp_url=desktop_cdp_url,
             codex_desktop_refresh_delay_ms=env_int(
                 "CODEX_DESKTOP_REFRESH_DELAY_MS", 800, 100, 5000
@@ -549,11 +543,58 @@ def latest_complete_turn(path: Path) -> Optional[Tuple[str, str]]:
     return latest
 
 
+def user_message_before_offset(path: Path, end_offset: int) -> str:
+    """Return the latest user message before one rollout record offset."""
+    latest = ""
+    try:
+        with path.open("rb") as handle:
+            while handle.tell() < end_offset:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line or line_start >= end_offset:
+                    break
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                payload = (
+                    record.get("payload")
+                    if isinstance(record, dict) and record.get("type") == "event_msg"
+                    else None
+                )
+                if not isinstance(payload, dict) or payload.get("type") != "user_message":
+                    continue
+                message = payload.get("message")
+                if isinstance(message, str) and message.strip():
+                    latest = message.strip()
+    except OSError:
+        return ""
+    return latest
+
+
 def session_record_event_id(path: Path, offset: int, record: Dict[str, Any]) -> str:
     encoded = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     resolved_path = os.path.normcase(str(path.resolve()))
     raw = f"{resolved_path}:{offset}:{encoded}".encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()
+
+
+def complete_jsonl_offset(path: Path) -> int:
+    """Return the byte offset immediately after the last complete JSONL line."""
+    size = path.stat().st_size
+    if size == 0:
+        return 0
+    with path.open("rb") as handle:
+        position = size
+        while position > 0:
+            chunk_size = min(8192, position)
+            position -= chunk_size
+            handle.seek(position)
+            chunk = handle.read(chunk_size)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                return position + newline + 1
+    return 0
 
 
 class SessionMonitor:
@@ -565,7 +606,7 @@ class SessionMonitor:
         poll_seconds: float = 0.75,
         thread_provider: Optional[Callable[[], str]] = None,
         threads_provider: Optional[Callable[[], Iterable[ThreadInfo]]] = None,
-        on_final_event: Optional[Callable[[ThreadInfo, str, str], None]] = None,
+        on_final_event: Optional[Callable[[ThreadInfo, str, str, str], None]] = None,
         on_interrupted: Optional[Callable[[ThreadInfo, str, str], None]] = None,
     ) -> None:
         self.config = config
@@ -586,11 +627,11 @@ class SessionMonitor:
         raw_offsets = stored.get("session_offsets")
         self._saved_offsets = raw_offsets if isinstance(raw_offsets, dict) else {}
         self._sessions_root = self.config.codex_sessions_dir.resolve()
-        self._startup_sizes: Dict[str, int] = {}
+        self._startup_offsets: Dict[str, int] = {}
         for startup_path in self._sessions_root.glob("**/rollout-*.jsonl"):
             try:
                 resolved = startup_path.resolve()
-                self._startup_sizes[str(resolved)] = resolved.stat().st_size
+                self._startup_offsets[str(resolved)] = complete_jsonl_offset(resolved)
             except OSError:
                 continue
         self._legacy_path = str(stored.get("session_path") or "")
@@ -632,6 +673,9 @@ class SessionMonitor:
         return [ThreadInfo(thread_id, thread_id, workdir, rollout_path=path)]
 
     def _initial_offset(self, thread_id: str, path: Path) -> int:
+        startup_offset = self._startup_offsets.pop(str(path), None)
+        if startup_offset is not None:
+            return min(max(0, startup_offset), path.stat().st_size)
         saved = self._saved_offsets.get(thread_id)
         if isinstance(saved, dict) and saved.get("path") == str(path):
             try:
@@ -641,7 +685,7 @@ class SessionMonitor:
             return min(max(0, offset), path.stat().st_size)
         if self._legacy_path == str(path):
             return min(max(0, self._legacy_offset), path.stat().st_size)
-        return min(self._startup_sizes.get(str(path), 0), path.stat().st_size)
+        return 0
 
     def _persist_offsets(self) -> None:
         serialized = dict(self._saved_offsets)
@@ -724,7 +768,12 @@ class SessionMonitor:
         message = final_message_from_record(record)
         if message:
             if self.on_final_event is not None:
-                self.on_final_event(info, message, event_id)
+                self.on_final_event(
+                    info,
+                    message,
+                    event_id,
+                    user_message_before_offset(path, offset),
+                )
             else:
                 self.on_final(info, message)
 
@@ -818,6 +867,8 @@ def extract_thread_id_from_codex_jsonl(output: str) -> Optional[str]:
 IGNORED_CODEX_WARNING_PARTS = (
     "codex_core_plugins::manifest:",
     "codex_core_plugins::manager:",
+    "codex_core_plugins::remote::remote_installed_plugin_sync:",
+    "codex_core_plugins::startup_sync:",
     "featured plugin",
 )
 
@@ -1080,7 +1131,7 @@ class CodexRunner:
 
 
 class CodexDesktopRefresher:
-    """Select one Desktop task by UUID and rebuild the renderer's history cache."""
+    """Fail closed until Desktop exposes a non-destructive synchronization API."""
 
     def __init__(
         self,
@@ -1093,110 +1144,349 @@ class CodexDesktopRefresher:
         self.cdp_url = cdp_url.rstrip("/")
         self.delay_seconds = max(0.0, delay_seconds)
         self.timeout_seconds = max(0.5, timeout_seconds)
+        self.last_detail = ""
 
-    def _main_page(self) -> Optional[Dict[str, Any]]:
-        with urlopen(f"{self.cdp_url}/json/list", timeout=self.timeout_seconds) as response:
-            targets = json.load(response)
-        if not isinstance(targets, list):
-            return None
-        for target in targets:
-            if (
-                isinstance(target, dict)
-                and target.get("type") == "page"
-                and target.get("url") == "app://-/index.html"
-                and isinstance(target.get("webSocketDebuggerUrl"), str)
-            ):
-                return target
-        return None
-
-    @staticmethod
-    def _request(
-        connection: Any,
-        request_id: int,
-        method: str,
-        params: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        connection.send(
-            json.dumps(
-                {"id": request_id, "method": method, "params": params},
-                ensure_ascii=True,
-            )
+    def refresh(self, thread_id: str, workdir: Optional[Path] = None) -> bool:
+        if not self.enabled:
+            self.last_detail = "disabled"
+            return False
+        self.last_detail = (
+            "automatic Desktop sync unavailable: no non-destructive Desktop API"
         )
-        while True:
-            response = json.loads(connection.recv())
-            if isinstance(response, dict) and response.get("id") == request_id:
-                return response
+        return False
 
-    def refresh(self, thread_id: str) -> bool:
+
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_TABLE_DIVIDER_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+_INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
+_REFERENCE_LINK_RE = re.compile(
+    r"(?<!\\)!?\[(?:\\.|[^\]\\\n])+\]\[(?:\\.|[^\]\\\n])*\]"
+)
+_AUTOLINK_RE = re.compile(r"(?<!\\)<(?:https?://|mailto:)[^<>\s]+>", re.IGNORECASE)
+_BARE_URL_START_RE = re.compile(r"(?<![A-Za-z0-9_<])https?://", re.IGNORECASE)
+
+
+def _markdown_link_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    index = 0
+    while index < len(text):
+        start = index
+        bracket = index
+        if text[index] == "!" and index + 1 < len(text) and text[index + 1] == "[":
+            bracket = index + 1
+        elif text[index] != "[":
+            index += 1
+            continue
+
+        slash_count = 0
+        cursor = start - 1
+        while cursor >= 0 and text[cursor] == "\\":
+            slash_count += 1
+            cursor -= 1
+        if slash_count % 2:
+            index = bracket + 1
+            continue
+
+        cursor = bracket + 1
+        bracket_depth = 1
+        while cursor < len(text) and bracket_depth:
+            char = text[cursor]
+            if char == "\n":
+                break
+            if char == "\\":
+                cursor += 2
+                continue
+            if char == "[":
+                bracket_depth += 1
+            elif char == "]":
+                bracket_depth -= 1
+            cursor += 1
+        if bracket_depth or cursor >= len(text) or text[cursor] != "(":
+            index = bracket + 1
+            continue
+
+        cursor += 1
+        paren_depth = 1
+        while cursor < len(text) and paren_depth:
+            char = text[cursor]
+            if char == "\n":
+                break
+            if char == "\\":
+                cursor += 2
+                continue
+            if char == "(":
+                paren_depth += 1
+            elif char == ")":
+                paren_depth -= 1
+            cursor += 1
+        if paren_depth:
+            index = bracket + 1
+            continue
+        spans.append((start, cursor))
+        index = cursor
+    return spans
+
+
+def _bare_url_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    for match in _BARE_URL_START_RE.finditer(text):
+        end = match.end()
+        while end < len(text) and not text[end].isspace() and text[end] not in '<>"\'`':
+            end += 1
+        while end > match.end() and text[end - 1] in ".,;:!?":
+            end -= 1
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while (
+                end > match.end()
+                and text[end - 1] == closing
+                and text[match.start() : end].count(closing)
+                > text[match.start() : end].count(opening)
+            ):
+                end -= 1
+        if end > match.end():
+            spans.append((match.start(), end))
+    return spans
+
+
+def _markdown_atomic_spans(text: str) -> List[Tuple[int, int]]:
+    matches = [(match.start(), match.end()) for match in _INLINE_CODE_RE.finditer(text)]
+    matches.extend(_markdown_link_spans(text))
+    matches.extend((match.start(), match.end()) for match in _REFERENCE_LINK_RE.finditer(text))
+    matches.extend((match.start(), match.end()) for match in _AUTOLINK_RE.finditer(text))
+    matches.extend(_bare_url_spans(text))
+    spans: List[Tuple[int, int]] = []
+    for span in sorted(matches, key=lambda value: (value[0], -value[1])):
+        if spans and span[0] < spans[-1][1]:
+            continue
+        spans.append(span)
+    return spans
+
+
+def _safe_inline_cut(text: str, max_chars: int) -> int:
+    spans = _markdown_atomic_spans(text)
+
+    def is_safe(position: int) -> bool:
+        return not any(start < position < end for start, end in spans)
+
+    candidates: List[int] = []
+    prefix = text[: max_chars + 1]
+    for match in re.finditer(r"\n\n|\n|[。！？!?；;，,]\s*|\s+", prefix):
+        position = match.end()
+        if 0 < position <= max_chars and is_safe(position):
+            candidates.append(position)
+    if candidates:
+        return max(candidates)
+    if is_safe(max_chars):
+        return max_chars
+    for start, end in spans:
+        if start < max_chars < end:
+            return start
+    return max_chars
+
+
+def _split_inline(text: str, max_chars: int) -> List[str]:
+    pieces: List[str] = []
+    remaining = text.strip()
+    while len(remaining) > max_chars:
+        cut = _safe_inline_cut(remaining, max_chars)
+        if cut <= 0:
+            spans = _markdown_atomic_spans(remaining)
+            oversized_end = spans[0][1] if spans and spans[0][0] == 0 else max_chars
+            pieces.append("[单个 Markdown 片段超过 QQ 单条限制，已省略]")
+            remaining = remaining[oversized_end:].lstrip()
+            continue
+        piece = remaining[:cut].rstrip()
+        if piece:
+            pieces.append(piece)
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def _split_plain_lines(lines: List[str], max_chars: int) -> List[str]:
+    pieces: List[str] = []
+    current = ""
+    for line in lines:
+        if len(line) > max_chars:
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.extend(_split_inline(line, max_chars))
+            continue
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                pieces.append(current)
+            current = line
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _split_fenced_block(lines: List[str], max_chars: int) -> List[str]:
+    opening = lines[0]
+    match = _FENCE_OPEN_RE.match(opening)
+    if match is None:
+        return _split_plain_lines(lines, max_chars)
+    marker = match.group(1)
+    has_closing = len(lines) > 1 and re.fullmatch(
+        rf"\s*{re.escape(marker[0])}{{{len(marker)},}}\s*", lines[-1]
+    )
+    closing = lines[-1] if has_closing else marker
+    content_lines = lines[1:-1] if has_closing else lines[1:]
+    overhead = len(opening) + len(closing) + 2
+    available = max_chars - overhead
+    if available < 1:
+        fallback = ["[代码块围栏过长，已转为分段文本]"]
+        info = opening[match.end() :].strip()
+        if info:
+            fallback.append(f"代码块信息：{info}")
+        fallback.extend(content_lines)
+        return _split_plain_lines(fallback, max_chars)
+    content = "\n".join(content_lines)
+    if not content:
+        return [f"{opening}\n{closing}"]
+    raw_parts: List[str] = []
+    remaining = content
+    while len(remaining) > available:
+        cut = remaining.rfind("\n", 0, available + 1)
+        if cut <= 0:
+            cut = available
+        raw_parts.append(remaining[:cut].rstrip("\n"))
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        raw_parts.append(remaining)
+    return [f"{opening}\n{part}\n{closing}" for part in raw_parts]
+
+
+def _split_table_block(lines: List[str], max_chars: int) -> List[str]:
+    header = "\n".join(lines[:2])
+    rows = lines[2:]
+    if len(header) > max_chars or any(
+        len(header) + 1 + len(row) > max_chars for row in rows
+    ):
+        fallback = [
+            "[表格过宽，已转为分段文本]",
+            f"- 表头：{lines[0].strip().strip('|').strip()}",
+        ]
+        fallback.extend(
+            f"- 第 {index} 行：{row.strip().strip('|').strip()}"
+            for index, row in enumerate(rows, start=1)
+        )
+        return _split_plain_lines(fallback, max_chars)
+    if not rows:
+        return [header]
+    pieces: List[str] = []
+    current = ""
+    for row in rows:
+        candidate = f"{current}\n{row}" if current else f"{header}\n{row}"
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            pieces.append(current)
+            current = f"{header}\n{row}"
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _markdown_blocks(text: str) -> List[Tuple[str, List[str]]]:
+    lines = text.splitlines()
+    blocks: List[Tuple[str, List[str]]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        fence_match = _FENCE_OPEN_RE.match(lines[index])
+        if fence_match is not None:
+            marker = fence_match.group(1)
+            block = [lines[index]]
+            index += 1
+            while index < len(lines):
+                block.append(lines[index])
+                index += 1
+                if re.fullmatch(
+                    rf"\s*{re.escape(marker[0])}{{{len(marker)},}}\s*", block[-1]
+                ):
+                    break
+            blocks.append(("fence", block))
+            continue
         if (
-            not self.enabled
-            or websocket is None
-            or not THREAD_ID_RE.fullmatch(thread_id)
+            index + 1 < len(lines)
+            and "|" in lines[index]
+            and _TABLE_DIVIDER_RE.fullmatch(lines[index + 1])
         ):
-            return False
-        connection = None
-        try:
-            page = self._main_page()
-            if page is None:
-                return False
-            connection = websocket.create_connection(
-                page["webSocketDebuggerUrl"],
-                timeout=self.timeout_seconds,
-                origin=self.cdp_url,
-            )
-            selector_id = json.dumps(f"local:{thread_id}")
-            expression = (
-                "(() => {"
-                f"const target = {selector_id};"
-                "const row = [...document.querySelectorAll("
-                "'[data-app-action-sidebar-thread-id]')].find("
-                "element => element.getAttribute('data-app-action-sidebar-thread-id') === target"
-                ");"
-                "if (!row) return {clicked: false};"
-                "row.click();"
-                "return {clicked: true};"
-                "})()"
-            )
-            click_response = self._request(
-                connection,
-                1,
-                "Runtime.evaluate",
-                {"expression": expression, "returnByValue": True},
-            )
-            click_value = (
-                click_response.get("result", {})
-                .get("result", {})
-                .get("value", {})
-            )
-            if not isinstance(click_value, dict) or click_value.get("clicked") is not True:
-                return False
-            time.sleep(self.delay_seconds)
-            reload_response = self._request(
-                connection,
-                2,
-                "Page.reload",
-                {"ignoreCache": True},
-            )
-            return "error" not in reload_response
-        except (OSError, ValueError, json.JSONDecodeError, websocket.WebSocketException):
-            return False
-        finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except Exception:
-                    pass
+            block = [lines[index], lines[index + 1]]
+            index += 2
+            while index < len(lines) and lines[index].strip() and "|" in lines[index]:
+                block.append(lines[index])
+                index += 1
+            blocks.append(("table", block))
+            continue
+        block = [lines[index]]
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            if _FENCE_OPEN_RE.match(lines[index]):
+                break
+            if (
+                index + 1 < len(lines)
+                and "|" in lines[index]
+                and _TABLE_DIVIDER_RE.fullmatch(lines[index + 1])
+            ):
+                break
+            block.append(lines[index])
+            index += 1
+        blocks.append(("plain", block))
+    return blocks
+
+
+def _split_markdown_chunks(text: str, max_chars: int) -> List[str]:
+    segments: List[str] = []
+    for kind, lines in _markdown_blocks(text):
+        if kind == "fence":
+            segments.extend(_split_fenced_block(lines, max_chars))
+        elif kind == "table":
+            segments.extend(_split_table_block(lines, max_chars))
+        else:
+            segments.extend(_split_plain_lines(lines, max_chars))
+
+    chunks: List[str] = []
+    current = ""
+    for segment in segments:
+        candidate = f"{current}\n\n{segment}" if current else segment
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = segment
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def split_message(text: str, max_chars: int, max_chunks: int) -> List[str]:
     normalized = text.strip() or "(Codex 没有返回文本结果)"
-    chunks = [normalized[index : index + max_chars] for index in range(0, len(normalized), max_chars)]
+    chunks = _split_markdown_chunks(normalized, max_chars)
     if len(chunks) <= max_chunks:
         return chunks
-    chunks = chunks[:max_chunks]
-    suffix = "\n\n[内容过长，已截断；回到 Codex Desktop 可查看完整结果]"
-    chunks[-1] = chunks[-1][: max(0, max_chars - len(suffix))] + suffix
-    return chunks
+
+    suffix = "[内容过长，已截断；回到 Codex Desktop 可查看完整结果]"
+    kept = chunks[:max_chunks]
+    available = max_chars - len(suffix) - 2
+    if available > 0:
+        final_parts = _split_markdown_chunks(kept[-1], available)
+        prefix = final_parts[0] if final_parts else ""
+        kept[-1] = f"{prefix}\n\n{suffix}" if prefix else suffix
+    else:
+        kept[-1] = suffix[:max_chars]
+    return kept
 
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((<[^>]+>|[^)\s]+)(?:\s+[^)]*)?\)")

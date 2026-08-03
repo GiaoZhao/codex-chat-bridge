@@ -90,7 +90,7 @@ def main() -> int:
     )
     command = shutil.which("codex") or "codex"
     bind_code = "".join(secrets.choice("0123456789") for _ in range(8))
-    desktop_refresh = "1" if sys.platform == "darwin" else "0"
+    desktop_refresh = "0"
 
     values = {
         "QQ_APP_ID": app_id,

@@ -167,7 +167,10 @@ class BridgeStore:
             now = time.time()
             retention_cutoff = now - 30 * 24 * 60 * 60
             connection.execute(
-                "DELETE FROM outbox WHERE status = 'sent' AND sent_at < ?",
+                """
+                DELETE FROM outbox
+                WHERE status IN ('sent', 'discarded') AND sent_at < ?
+                """,
                 (retention_cutoff,),
             )
             connection.execute(
@@ -428,6 +431,19 @@ class BridgeStore:
         now: float,
     ) -> List[Tuple[int, bool]]:
         results: List[Tuple[int, bool]] = []
+        existing_groups: Dict[str, int] = {}
+        for group_key in {item.group_key for item in items if item.group_key}:
+            existing_group = connection.execute(
+                """
+                SELECT outbox_id FROM outbox
+                WHERE group_key = ?
+                ORDER BY outbox_id
+                LIMIT 1
+                """,
+                (group_key,),
+            ).fetchone()
+            if existing_group:
+                existing_groups[group_key] = int(existing_group["outbox_id"])
         for item in items:
             encoded = json.dumps(
                 item.payload,
@@ -440,6 +456,9 @@ class BridgeStore:
             ).fetchone()
             if existing:
                 results.append((int(existing["outbox_id"]), False))
+                continue
+            if item.group_key in existing_groups:
+                results.append((existing_groups[item.group_key], False))
                 continue
             cursor = connection.execute(
                 """
@@ -466,17 +485,17 @@ class BridgeStore:
             connection.commit()
         return results
 
-    def recover_outbox_leases(self) -> int:
+    def discard_pending_outbox(self) -> int:
         now = time.time()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE outbox
-                SET status = 'pending', lease_until = 0, next_attempt_at = 0,
-                    updated_at = ?
-                WHERE status = 'sending'
+                SET status = 'discarded', lease_until = 0, next_attempt_at = 0,
+                    last_error = '', sent_at = ?, updated_at = ?
+                WHERE status IN ('pending', 'sending')
                 """,
-                (now,),
+                (now, now),
             )
             return cursor.rowcount
 
@@ -497,7 +516,7 @@ class BridgeStore:
                         SELECT 1 FROM outbox AS earlier
                         WHERE earlier.group_key = candidate.group_key
                           AND earlier.outbox_id < candidate.outbox_id
-                          AND earlier.status <> 'sent'
+                          AND earlier.status NOT IN ('sent', 'discarded')
                     )
                 )
                 ORDER BY candidate.outbox_id

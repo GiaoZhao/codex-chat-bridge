@@ -329,7 +329,45 @@ class SessionTests(unittest.TestCase):
             monitor.stop()
             self.assertEqual(received, ["complete later"])
 
-    def test_monitor_resumes_persisted_offsets_after_restart(self) -> None:
+    def test_monitor_startup_baseline_keeps_an_incomplete_jsonl_line(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            path = root / f"rollout-now-{thread_id}.jsonl"
+            record = json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": "finished after startup",
+                    },
+                }
+            ).encode("utf-8")
+            cut = len(record) // 2
+            path.write_bytes(b"{}\n" + record[:cut])
+            received = []
+            config = SimpleNamespace(codex_sessions_dir=root, codex_thread_id=thread_id)
+            monitor = SessionMonitor(
+                config,
+                StateStore(root / "state.json"),
+                lambda _info, message: received.append(message),
+                poll_seconds=0.02,
+            )
+            monitor.start()
+            time.sleep(0.08)
+            self.assertEqual(received, [])
+
+            with path.open("ab") as handle:
+                handle.write(record[cut:] + b"\n")
+            deadline = time.time() + 2
+            while not received and time.time() < deadline:
+                time.sleep(0.02)
+            monitor.stop()
+
+            self.assertEqual(received, ["finished after startup"])
+
+    def test_monitor_skips_offline_history_after_restart_and_reads_new_final(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
             thread_id = "00000000-0000-4000-8000-000000000001"
@@ -363,11 +401,61 @@ class SessionTests(unittest.TestCase):
                 poll_seconds=0.02,
             )
             second.start()
+            time.sleep(0.08)
+            self.assertEqual(received, [])
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "agent_message",
+                                "phase": "final_answer",
+                                "message": "after restart",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
             deadline = time.time() + 2
             while not received and time.time() < deadline:
                 time.sleep(0.02)
             second.stop()
-            self.assertEqual(received, ["while offline"])
+            self.assertEqual(received, ["after restart"])
+
+    def test_final_event_includes_the_user_message_from_the_same_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            path = root / f"rollout-now-{thread_id}.jsonl"
+            user_record = {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "current question"},
+            }
+            path.write_text(json.dumps(user_record) + "\n", encoding="utf-8")
+            final_offset = path.stat().st_size
+            final_record = {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "current answer",
+                },
+            }
+            callback = Mock()
+            config = SimpleNamespace(codex_sessions_dir=root, codex_thread_id=thread_id)
+            monitor = SessionMonitor(
+                config,
+                StateStore(root / "state.json"),
+                Mock(),
+                on_final_event=callback,
+            )
+            info = ThreadInfo(thread_id, "task", root, rollout_path=path)
+
+            monitor._handle_record(info, final_record, path, final_offset)
+
+            self.assertEqual(callback.call_args.args[1], "current answer")
+            self.assertEqual(callback.call_args.args[3], "current question")
 
 
 class ThreadIndexTests(unittest.TestCase):
@@ -583,57 +671,35 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(images, [])
             self.assertEqual(text, "[本地图片未转发]")
 
-    def test_desktop_refresh_selects_uuid_and_reloads_renderer(self) -> None:
+    def test_desktop_refresh_fails_closed_without_touching_desktop(self) -> None:
         thread_id = "00000000-0000-4000-8000-000000000001"
-        refresher = CodexDesktopRefresher(enabled=True, delay_seconds=0)
-        connection = Mock()
-        connection.recv.side_effect = [
-            json.dumps(
-                {
-                    "id": 1,
-                    "result": {"result": {"value": {"clicked": True}}},
-                }
-            ),
-            json.dumps({"id": 2, "result": {}}),
-        ]
-        page = {"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/main"}
-        with patch.object(refresher, "_main_page", return_value=page), patch(
-            "bridge_core.websocket.create_connection", return_value=connection
-        ):
-            self.assertTrue(refresher.refresh(thread_id))
-        requests = [json.loads(call.args[0]) for call in connection.send.call_args_list]
-        self.assertEqual(
-            [request["method"] for request in requests],
-            ["Runtime.evaluate", "Page.reload"],
-        )
-        self.assertIn(f"local:{thread_id}", requests[0]["params"]["expression"])
-        self.assertEqual(requests[1]["params"], {"ignoreCache": True})
-        connection.close.assert_called_once()
+        with tempfile.TemporaryDirectory() as raw_dir:
+            workdir = Path(raw_dir)
+            refresher = CodexDesktopRefresher(enabled=True, delay_seconds=0)
+            self.assertFalse(refresher.refresh(thread_id, workdir))
 
-    def test_desktop_refresh_does_not_reload_when_thread_row_is_missing(self) -> None:
-        thread_id = "00000000-0000-4000-8000-000000000001"
-        refresher = CodexDesktopRefresher(enabled=True, delay_seconds=0)
-        connection = Mock()
-        connection.recv.return_value = json.dumps(
-            {
-                "id": 1,
-                "result": {"result": {"value": {"clicked": False}}},
-            }
+        self.assertEqual(
+            refresher.last_detail,
+            "automatic Desktop sync unavailable: no non-destructive Desktop API",
         )
-        with patch.object(
-            refresher,
-            "_main_page",
-            return_value={"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/main"},
-        ), patch("bridge_core.websocket.create_connection", return_value=connection):
-            self.assertFalse(refresher.refresh(thread_id))
-        requests = [json.loads(call.args[0]) for call in connection.send.call_args_list]
-        self.assertEqual([request["method"] for request in requests], ["Runtime.evaluate"])
+
+    def test_desktop_refresh_respects_disabled_setting(self) -> None:
+        refresher = CodexDesktopRefresher(enabled=False)
+
+        self.assertFalse(
+            refresher.refresh("00000000-0000-4000-8000-000000000001")
+        )
+        self.assertEqual(refresher.last_detail, "disabled")
 
     def test_error_summary_removes_unrelated_plugin_warnings(self) -> None:
         stderr = "\n".join(
             [
                 "WARN codex_core_plugins::manifest: prompt too long",
                 "WARN codex_core_plugins::manager: failed to warm featured plugin ids cache",
+                "WARN codex_core_plugins::remote::remote_installed_plugin_sync: "
+                "chatgpt authentication required for remote plugin catalog",
+                "WARN codex_core_plugins::startup_sync: git sync failed: "
+                "Failed to connect to github.com",
                 "WARN codex_core::responses_retry: stream disconnected",
                 "sampling_error=Upstream request failed",
             ]
@@ -641,6 +707,8 @@ class RunnerTests(unittest.TestCase):
         summary = summarize_codex_error(stderr)
         self.assertNotIn("plugins::manifest", summary)
         self.assertNotIn("featured plugin", summary)
+        self.assertNotIn("remote plugin catalog", summary)
+        self.assertNotIn("github.com", summary)
         self.assertIn("stream disconnected", summary)
         self.assertIn("Upstream request failed", summary)
 
@@ -656,16 +724,15 @@ class BridgeServiceTests(unittest.TestCase):
             )
             service = BridgeService.__new__(BridgeService)
             service.config = SimpleNamespace(qq_attachment_max_images=3)
-            service._current_openid = Mock(return_value="openid")
-            service._safe_send = Mock()
-            service._safe_send_images = Mock()
             with patch("bridge.qq_safe_final", return_value=("result", [])) as safe_final:
-                service._on_final(thread, "raw result")
+                notification, keyboard, images = service._prepare_final_notification(
+                    thread,
+                    "raw result",
+                )
             safe_final.assert_called_once_with("raw result", root, 3)
-            notification = service._safe_send.call_args.args[1]
+            self.assertEqual(images, [])
             self.assertIn("another task", notification)
             self.assertIn(thread.thread_id, notification)
-            keyboard = service._safe_send.call_args.kwargs["keyboard"]
             command = keyboard["content"]["rows"][0]["buttons"][0]["action"]["data"]
             self.assertEqual(command, f"/use {thread.thread_id}")
 
@@ -873,6 +940,81 @@ class QQTests(unittest.TestCase):
         chunks = split_message("x" * 100, 20, 2)
         self.assertEqual(len(chunks), 2)
         self.assertIn("已截断", chunks[-1])
+
+    def test_split_keeps_markdown_links_intact(self) -> None:
+        link = "[BS11](https://www.bs11.jp/program/)"
+        chunks = split_message(f"前文 {'x' * 70}\n\n来源：{link}\n\n后文", 90, 8)
+
+        self.assertTrue(all(len(chunk) <= 90 for chunk in chunks))
+        self.assertEqual(sum(chunk.count(link) for chunk in chunks), 1)
+        self.assertFalse(any("[BS1" in chunk and link not in chunk for chunk in chunks))
+
+    def test_split_omits_one_oversized_link_with_nested_parentheses_as_a_unit(self) -> None:
+        link = "[docs](https://example.com/path(" + "x" * 90 + ")/tail)"
+        chunks = split_message(link, 70, 8)
+
+        self.assertEqual(
+            chunks,
+            ["[单个 Markdown 片段超过 QQ 单条限制，已省略]"],
+        )
+
+    def test_split_protects_autolinks_bare_urls_and_reference_links(self) -> None:
+        values = [
+            "<https://example.com/" + "a" * 90 + ">",
+            "https://example.com/path(" + "b" * 90 + ")",
+            "[reference " + "c" * 70 + "][docs]",
+        ]
+
+        for value in values:
+            with self.subTest(value=value[:20]):
+                self.assertEqual(
+                    split_message(value, 70, 8),
+                    ["[单个 Markdown 片段超过 QQ 单条限制，已省略]"],
+                )
+
+        self.assertEqual(
+            split_message("见https://example.com/" + "d" * 90, 70, 8),
+            ["见\n\n[单个 Markdown 片段超过 QQ 单条限制，已省略]"],
+        )
+
+    def test_split_repeats_table_header_for_each_table_chunk(self) -> None:
+        header = "| 时间 | 动画与集数 |\n| --- | --- |"
+        rows = [f"| {index:02d}:00 | 第 {index} 集内容 |" for index in range(12)]
+        chunks = split_message("\n".join([header, *rows]), 110, 20)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.startswith(header) for chunk in chunks))
+        self.assertTrue(all(len(chunk) <= 110 for chunk in chunks))
+
+    def test_split_degrades_a_table_when_one_row_cannot_fit_with_its_header(self) -> None:
+        header = "| 时间 | 动画与集数 |\n| --- | --- |"
+        row_content = "x" * 170
+        chunks = split_message(f"{header}\n| 10:00 | {row_content} |", 200, 8)
+
+        self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
+        self.assertIn("[表格过宽，已转为分段文本]", chunks[0])
+        self.assertTrue(any("表头" in chunk for chunk in chunks))
+        self.assertTrue(any("第 1 行" in chunk for chunk in chunks))
+        self.assertEqual(sum(chunk.count("x") for chunk in chunks), len(row_content))
+        self.assertFalse(any("| --- | --- |" in chunk for chunk in chunks))
+
+    def test_split_closes_and_reopens_fenced_code(self) -> None:
+        code = "```python\n" + "\n".join(f"print({index})" for index in range(20)) + "\n```"
+        chunks = split_message(code, 80, 20)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.startswith("```python\n") for chunk in chunks))
+        self.assertTrue(all(chunk.endswith("\n```") for chunk in chunks))
+        self.assertTrue(all(len(chunk) <= 80 for chunk in chunks))
+
+    def test_split_degrades_a_code_fence_with_an_oversized_info_string(self) -> None:
+        code = "```" + "language" * 20 + "\nprint(1)\n```"
+        chunks = split_message(code, 50, 20)
+
+        self.assertTrue(all(len(chunk) <= 50 for chunk in chunks))
+        self.assertIn("[代码块围栏过长，已转为分段文本]", chunks[0])
+        self.assertFalse(any("```" in chunk for chunk in chunks))
+        self.assertTrue(any("print(1)" in chunk for chunk in chunks))
 
 
 if __name__ == "__main__":
