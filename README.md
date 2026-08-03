@@ -5,13 +5,14 @@
 
 - 任一可见的 Codex Desktop 根任务产生最终结果后，桥接器都把任务标题和结果主动发送
   到已绑定 QQ；guardian、subagent 和已归档任务不会推送。
-- QQ 私聊机器人发送普通文字后，桥接器使用当前所选 Thread UUID 执行
-  `codex exec resume`，继续对应的原生 Codex 会话。
+- QQ 私聊机器人发送普通文字后，macOS 可通过 standalone Codex shared daemon 直接在
+  Desktop 对应任务中启动回合；shared daemon 不可用时可回退 `codex exec resume`。
 - 可从 QQ 列出桌面端任务、切换任务，或在当前项目目录中新建任务。
 - QQ 回复优先使用 Markdown 卡片和快捷按钮，失败时自动回退到纯文本。
 - QQ 图片可作为图片输入交给 Codex；Codex 明确返回的安全本地图片可上传回 QQ。
 - 普通任务开始时会显示 QQ“正在输入”状态。
-- Bridge 不自动重载、切换或清理 Codex Desktop 页面缓存；QQ 回合只写入原生会话文件。
+- Bridge 不自动重载、切换或清理 Codex Desktop 页面缓存。使用 shared daemon 时，QQ
+  回合和任务标题会由 Codex 实时广播到 Desktop。
 - QQ 消息会先持久化再排队；当前任务执行中收到的新消息不会同时写入同一个会话。
 - 首次使用一次性绑定码，绑定后只接受该 QQ `openid`。
 
@@ -30,27 +31,32 @@
 
 ## 当前实现边界
 
-本实现已在 macOS 与 Codex CLI `0.146.0-alpha.3.1` 上验证按 UUID 续接会话，桌面任务
-保存在 `~/.codex/sessions` 原生会话文件中。其他系统和版本可能存在兼容性差异。
-Windows 的配置、命令路径、PowerShell 启动和核心桥接路径已有兼容处理，但目前没有
-Windows 真机验证结论。Codex Desktop 的内部 Socket 不是可直接复用的公开 app-server
-control socket，因此本版本使用“监听会话文件 + CLI resume”。
+本实现已在 macOS、standalone Codex `0.146.0` 和 Codex Desktop shared daemon 上验证。
+使用 shared daemon 时，Bridge 与 Desktop 连接同一个 app-server：QQ 发起的用户消息、
+执行过程和最终回复会实时出现在 Desktop 对应任务中；`/new` 会把首条消息摘要显式设置为
+任务标题。桌面任务仍保存在 `~/.codex/sessions` 原生会话文件中。
 
-QQ 回复会写入所选任务的原生会话。Codex Desktop 不会订阅外部 CLI 连接的回合事件，
-因此当前打开的页面可能不会立即显示 QQ 新回合。此前尝试的 renderer reload 会卡住页面，
-而 Desktop 当前版本的私有缓存清理动作可能中断新回合，并在窗口不处于前台时留下未恢复
-的缓存。当前版本因此将自动 Desktop 同步失败关闭：不连接调试端口、不操作页面、不清理
-缓存。`CODEX_DESKTOP_REFRESH` 保留为未来兼容配置，目前即使设为 `1` 也只记录无法安全
-同步，不执行 Desktop 操作。只有在 Codex 提供可验证、非破坏性的接口后才会重新启用。
-桥接器不会接管 Codex Desktop 原生命令级审批；需要人工批准的操作仍可能在桌面端
-等待。不要为方便而启用绕过沙箱的参数。
+shared daemon 目前是 Codex 的实验能力，版本变化可能带来兼容性差异。Bridge 默认使用
+`CODEX_TRANSPORT=auto`：macOS 检测到 control socket 时使用 `app-server`，否则回退
+`codex exec`。若 socket 已存在但协议握手失败，Bridge 会明确启动失败，不会静默回退，
+避免用户误以为 Desktop 正在同步。可设为 `app-server` 强制要求 shared daemon，或设为
+`exec` 强制使用旧路径。
+
+Windows 的配置、命令路径、PowerShell 启动和核心桥接路径已有兼容处理，但目前没有
+Windows 真机端到端验证结论，且当前固定回退 `codex exec`，不能保证 Desktop 实时显示
+QQ 新回合。旧路径只写入原生会话文件，Desktop 可能不会立刻刷新。Bridge 在所有传输模式
+下都不连接调试端口、不操作页面、不清理缓存、不重载 renderer；`CODEX_DESKTOP_REFRESH`
+只是保留配置，即使设为 `1` 也不会执行 Desktop 操作。
+
+桥接器不会远程代替用户批准 Codex 命令或文件操作。shared daemon 请求审批时，QQ 会提示
+打开 Desktop 对应任务处理；不要为方便而启用绕过沙箱的参数。
 
 QQ Gateway 建立 READY 会话时的“Bridge 已上线”消息默认关闭，避免网络重连产生重复
 通知。如需启动提醒，将 `.env` 中的 `QQ_NOTIFY_ON_READY` 设为 `1`；同一 Bridge 进程
 即使重连多次也只发送一次。
 
-QQ 发起任务时会依次区分“已接收并保存”“等待已有任务”和“Codex 子进程已启动”；只有
-成功创建 Codex 子进程后才会发送第三种回执。任务队列和待发送通知保存在
+QQ 发起任务时会依次区分“已接收并保存”“等待已有任务”和“Codex 回合已启动”；只有
+成功创建 shared daemon 回合或 Codex 子进程后才会发送第三种回执。任务队列和待发送通知保存在
 `data/bridge.sqlite3`。Bridge 运行期间遇到 QQ 或网络短暂断开时会继续重试；Bridge 重启时
 会恢复尚未派发的任务，但会丢弃上个进程没有发出的旧通知，避免上线后集中补发。为避免
 重复执行，已进入派发或运行阶段但被异常中断的任务不会自动重跑，而会在 QQ 中提示人工
@@ -75,7 +81,7 @@ QQ 发起任务时会依次区分“已接收并保存”“等待已有任务�
 ## 前置条件
 
 1. 运行桥接器的 Mac 或 Windows 电脑保持开机、联网且不进入睡眠。
-2. 已安装 Python 3 和 Codex CLI，且 Codex CLI 已登录并可通过 `codex` 命令启动。
+2. 已安装 Python 3 和 standalone Codex，且 Codex 已登录并可通过 `codex` 命令启动。
 3. 已在 [QQ 开放平台](https://bot.q.qq.com/) 创建机器人，取得 AppID 和 AppSecret，
    并开通 C2C 私聊消息事件。
 
@@ -88,9 +94,18 @@ git clone https://github.com/GiaoZhao/codex-chat-bridge.git
 cd codex-chat-bridge
 ./scripts/setup.sh
 ./.venv/bin/python configure.py
+codex app-server daemon start
+launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1
 ./scripts/run.sh --check
 ./scripts/run.sh
 ```
+
+`codex app-server daemon` 需要包含该命令的 standalone Codex；本项目已验证 `0.146.0`。
+设置 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 后，完整退出并重新打开 Codex Desktop，确保
+Desktop 和 Bridge 都连接 `~/.codex/app-server-control/app-server-control.sock`。当前手动
+启动的 daemon 和 `launchctl setenv` 设置不应视为跨重启持久配置；电脑重启或重新登录后，
+应重新执行以上两条命令并重启 Desktop。`./scripts/run.sh --check` 显示
+`Transport: app-server` 和 daemon 的 `userAgent` 才表示共享传输就绪。
 
 macOS 可改用安全弹窗输入凭证：
 
@@ -116,8 +131,8 @@ Set-Location codex-chat-bridge
 
 Windows 配置器使用终端输入，不支持 `configure.py --gui`。配置器在所有平台都写入
 `CODEX_DESKTOP_REFRESH=0`；该预留开关当前不会触发 Desktop 操作。Windows 核心桥接
-兼容实现尚未经过真机端到端验证，建议先执行 `--check`，确认 Codex 命令、任务索引和
-会话文件均可读取后再启动。
+兼容实现尚未经过真机端到端验证，并会使用 `exec` 传输。建议先执行 `--check`，确认
+Codex 命令、任务索引和会话文件均可读取后再启动。
 
 `configure.py` 会要求输入 QQ AppID、AppSecret、一个初始 Codex Thread UUID，以及该
 任务的工作目录。若不知道 Thread UUID，可在终端列出最近的本地根任务。
@@ -184,8 +199,8 @@ with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
 `/threads` 中 `*` 表示当前任务。切换成功后会直接读取本地 JSONL，返回最后一条已有
 Codex 最终回复的用户消息及对应最终回复；这段内容不调用模型、不总结、不改写。之后
 的普通 QQ 消息都会进入新选择的任务。
-`/new` 必须带第一条消息，因为 Codex CLI 通过首条消息创建任务；新任务完成后会自动
-设为当前任务。为防止不同任务串线，执行中或队列非空时不能 `/use` 或 `/new`。
+`/new` 必须带第一条消息；新任务标题取该消息的前 80 个字符，完成后会自动设为当前
+任务。为防止不同任务串线，执行中或队列非空时不能 `/use` 或 `/new`。
 
 QQ 入站图片仅接受 HTTPS 图片附件，默认每张最大 20MB、每条最多 3 张。临时下载文件
 会在本次 Codex 执行结束后删除。Codex 回复中的 Markdown 本地图片只允许来自当前任务
@@ -215,9 +230,9 @@ AppID/AppSecret 获取 QQ token 并连接官方 WebSocket Gateway。
 
 - 只在 QQ 官方平台创建机器人；不要把 AppSecret、绑定码、`openid` 或 `.env` 发到聊天。
 - 首次绑定完成后，可删除 `.env` 中的 `QQ_BIND_CODE`，保留 `data/state.json` 的绑定状态。
-- `/cancel` 只终止由 QQ 桥接器启动的 Codex 子进程，不能取消桌面 App 发起的任务。
+- `/cancel` 只终止由 QQ Bridge 启动的 Codex 回合或子进程，不能取消 Desktop 发起的任务。
 - 正常停止或升级桥接时会等待 QQ 发起的 Codex 任务完成；再次发送停止信号才会强制
-  取消当前子进程，避免升级产生 `-15` 中断。
+  取消当前回合，避免升级产生意外中断。
 - 被动回复遵守 QQ 单条消息最多 4 次回复限制；更长内容会截断并提示回桌面端查看。
 - 本项目不提供 `--dangerously-bypass-approvals-and-sandbox` 或远程权限切换。
 
