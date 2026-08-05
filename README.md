@@ -36,11 +36,11 @@
 执行过程和最终回复会实时出现在 Desktop 对应任务中；`/new` 会把首条消息摘要显式设置为
 任务标题。桌面任务仍保存在 `~/.codex/sessions` 原生会话文件中。
 
-shared daemon 目前是 Codex 的实验能力，版本变化可能带来兼容性差异。Bridge 默认使用
-`CODEX_TRANSPORT=auto`：macOS 检测到 control socket 时使用 `app-server`，否则回退
-`codex exec`。若 socket 已存在但协议握手失败，Bridge 会明确启动失败，不会静默回退，
-避免用户误以为 Desktop 正在同步。可设为 `app-server` 强制要求 shared daemon，或设为
-`exec` 强制使用旧路径。
+shared daemon 目前是 Codex 的实验能力，版本变化和账号策略可能带来兼容性差异。Bridge
+手动运行时默认使用 `CODEX_TRANSPORT=auto`：macOS 检测到由官方 Codex 客户端建立的
+control socket 时使用 `app-server`，否则回退 `codex exec`。LaunchAgent 默认使用
+`exec`，不会自行 bootstrap shared daemon，避免 Bridge 被上游识别为非官方客户端。
+`exec` 模式不保证 Desktop 实时显示 QQ 回合。
 
 Windows 的配置、命令路径、PowerShell 启动和核心桥接路径已有兼容处理，但目前没有
 Windows 真机端到端验证结论，且当前固定回退 `codex exec`，不能保证 Desktop 实时显示
@@ -94,18 +94,35 @@ git clone https://github.com/GiaoZhao/codex-chat-bridge.git
 cd codex-chat-bridge
 ./scripts/setup.sh
 ./.venv/bin/python configure.py
-codex app-server daemon start
-launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1
 ./scripts/run.sh --check
-./scripts/run.sh
+./scripts/macos-service.sh install
 ```
 
-`codex app-server daemon` 需要包含该命令的 standalone Codex；本项目已验证 `0.146.0`。
-设置 `CODEX_APP_SERVER_USE_LOCAL_DAEMON=1` 后，完整退出并重新打开 Codex Desktop，确保
-Desktop 和 Bridge 都连接 `~/.codex/app-server-control/app-server-control.sock`。当前手动
-启动的 daemon 和 `launchctl setenv` 设置不应视为跨重启持久配置；电脑重启或重新登录后，
-应重新执行以上两条命令并重启 Desktop。`./scripts/run.sh --check` 显示
-`Transport: app-server` 和 daemon 的 `userAgent` 才表示共享传输就绪。
+默认安装使用官方 `codex exec`，优先保证账号兼容性和后台可靠性。若账号允许 Bridge
+作为 app-server 客户端，且 Desktop 已经建立 shared daemon，可改用
+`./scripts/macos-service.sh install --transport auto`。`auto` 只接受 `userAgent` 以
+`Codex Desktop/` 或 `codex-cli/` 开头的 daemon；socket 缺失或身份不符合时回退 `exec`。
+`--transport app-server` 为严格模式，条件不满足时启动失败。Bridge 不会自行 bootstrap
+daemon，也不会伪装成官方客户端。
+
+LaunchAgent 使用 `RunAtLoad` 和 `KeepAlive` 管理 Bridge，登录后自动启动，异常退出后自动
+拉起，不依赖终端或 Codex 工具会话。macOS 不允许后台 LaunchAgent 直接读取受保护的
+`Documents` 目录，因此安装命令会把运行副本和依赖部署到
+`~/Library/Application Support/CodexQQBridge`。常用管理命令：
+
+```bash
+./scripts/macos-service.sh status
+./scripts/macos-service.sh restart
+./scripts/macos-service.sh install --transport auto
+./scripts/macos-service.sh uninstall
+```
+
+安装时如果检测到手动启动的 Bridge，会拒绝并提示先停止该实例，避免两个进程争用同一
+状态库。`.env` 每次安装都会以 `0600` 同步到运行目录；`state.json`、SQLite 队列和历史
+日志只在首次安装时迁移，后续重装不会覆盖运行状态。源码更新或源目录配置变化后，重新
+执行 `install` 即可部署。LaunchAgent 配置写入
+`~/Library/LaunchAgents/com.giaozhao.codex-chat-bridge.plist`，卸载命令会停止服务并删除
+该文件，但保留 Application Support 中的 `.env`、绑定状态、任务队列和日志。
 
 macOS 可改用安全弹窗输入凭证：
 
@@ -116,7 +133,8 @@ macOS 可改用安全弹窗输入凭证：
 AppSecret 输入框会隐藏内容，值不会出现在命令行或程序输出中。
 
 `scripts/run.sh` 默认通过 macOS `caffeinate -i` 在桥接器运行期间阻止空闲睡眠，但允许
-正常锁屏。临时关闭这一行为可使用 `CODEX_QQ_KEEP_AWAKE=0 ./scripts/run.sh`。
+正常锁屏。LaunchAgent 也保留相同的防睡眠行为。临时手动运行时可使用
+`CODEX_QQ_KEEP_AWAKE=0 ./scripts/run.sh` 关闭防睡眠。
 
 ### Windows PowerShell
 
@@ -214,6 +232,7 @@ macOS：
 ```bash
 ./.venv/bin/python -m unittest discover -s tests -v
 ./scripts/run.sh --check
+./scripts/macos-service.sh status
 ```
 
 Windows PowerShell：

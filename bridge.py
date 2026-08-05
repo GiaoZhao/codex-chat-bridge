@@ -72,6 +72,7 @@ class JobDispatchUncertainError(RuntimeError):
 def select_codex_runner(config: Config, verify: bool = True) -> Any:
     mode = str(getattr(config, "codex_transport", "exec") or "exec").lower()
     if mode == "exec":
+        log_event("codex-transport", "using exec transport")
         return CodexRunner(config)
 
     socket_path = Path(
@@ -101,6 +102,23 @@ def select_codex_runner(config: Config, verify: bool = True) -> Any:
                     f"Codex shared daemon socket 存在但握手失败: {exc}"
                 ) from exc
             user_agent = str(info.get("userAgent") or "unknown")
+            normalized_user_agent = user_agent.casefold()
+            official_daemon = normalized_user_agent.startswith(
+                ("codex desktop/", "codex-cli/")
+            )
+            if not official_daemon:
+                detail = (
+                    "shared daemon 不是由 Codex 官方客户端建立: "
+                    f"userAgent={user_agent}"
+                )
+                if mode == "app-server":
+                    raise ValueError(detail)
+                log_event(
+                    "codex-transport",
+                    f"using exec fallback: {detail}",
+                    level="WARNING",
+                )
+                return CodexRunner(config)
             log_event(
                 "codex-transport",
                 f"using app-server socket={socket_path} userAgent={user_agent}",

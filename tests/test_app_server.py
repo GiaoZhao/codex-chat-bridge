@@ -516,6 +516,25 @@ class TransportSelectionTests(unittest.TestCase):
         self.assertIs(runner, app_runner)
         self.assertEqual(runner.probe_info["userAgent"], "codex-cli/0.146.0")
 
+    def test_auto_falls_back_when_daemon_identity_is_not_official(self) -> None:
+        app_runner = Mock()
+        app_runner.probe.return_value = {"userAgent": "codex-chat-bridge/0.146.0"}
+        with patch("bridge.Path.is_socket", return_value=True), patch(
+            "bridge.AppServerCodexRunner", return_value=app_runner
+        ):
+            runner = select_codex_runner(self.config("auto"))
+
+        self.assertIsInstance(runner, CodexRunner)
+
+    def test_explicit_app_server_rejects_non_official_daemon_identity(self) -> None:
+        app_runner = Mock()
+        app_runner.probe.return_value = {"userAgent": "codex-chat-bridge/0.146.0"}
+        with patch("bridge.Path.is_socket", return_value=True), patch(
+            "bridge.AppServerCodexRunner", return_value=app_runner
+        ):
+            with self.assertRaisesRegex(ValueError, "不是由 Codex 官方客户端建立"):
+                select_codex_runner(self.config("app-server"))
+
     def test_existing_socket_with_failed_handshake_does_not_fallback(self) -> None:
         app_runner = Mock()
         app_runner.probe.side_effect = AppServerProtocolError("bad handshake")

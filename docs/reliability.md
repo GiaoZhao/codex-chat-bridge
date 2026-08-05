@@ -60,16 +60,27 @@ Codex Desktop 查看完整结果。
 标题通过 `thread/name/set` 显式设置。Bridge 不连接调试端口、不切换页面、不清理缓存、
 不重载 renderer；预留开关即使设为 `1` 也不执行 Desktop 操作。
 
-`CODEX_TRANSPORT=auto` 在 control socket 存在时选择 `app-server`，否则选择 `exec`。
-socket 存在但握手失败会阻止 Bridge 启动，防止以未同步状态继续运行。强制模式分别为
-`app-server` 和 `exec`。Windows 当前固定使用 `exec`，外部 CLI 回合虽然写入原生会话，
-Desktop 当前页面仍可能不会立即更新。
+`CODEX_TRANSPORT=auto` 在 control socket 存在且握手返回官方 daemon 身份时选择
+`app-server`，否则选择 `exec`。官方身份当前限定为 `userAgent` 以 `Codex Desktop/` 或
+`codex-cli/` 开头；`codex-chat-bridge/` 会回退 `exec`。严格 `app-server` 模式遇到非官方
+身份、socket 缺失或握手失败时阻止 Bridge 启动。Windows 当前固定使用 `exec`，外部 CLI
+回合虽然写入原生会话，Desktop 当前页面仍可能不会立即更新。
 
-shared daemon 是实验能力。当前 macOS 启动方式依赖 `codex app-server daemon start` 和
-`launchctl setenv CODEX_APP_SERVER_USE_LOCAL_DAEMON 1`；电脑重启或重新登录后不能假定二者
-仍然生效，应重新启动 daemon、完整重启 Desktop，并用 `scripts/run.sh --check` 确认输出
-`Transport: app-server`。审批请求不会由 Bridge 自动同意；QQ 只发送提示，实际决定在
-Desktop 对应任务完成。
+shared daemon 是实验能力。macOS LaunchAgent 默认使用 `exec`，安装和启动时都不执行
+`daemon bootstrap`，避免 Bridge 抢先成为 daemon 客户端身份。只有 Desktop 已建立可验证
+的官方 daemon 且账号策略允许 Bridge app-server 调用时，才使用
+`scripts/macos-service.sh install --transport auto`。若上游返回“只允许官方客户端”，应
+恢复默认 `exec`；Bridge 不伪装官方客户端。审批请求不会由 Bridge 自动同意；QQ 只发送
+提示，实际决定在 Desktop 对应任务完成。
+
+Bridge 本身应使用 `scripts/macos-service.sh install` 安装为用户 LaunchAgent。不要把
+`scripts/run.sh` 作为 Codex 工具调用或临时 PTY 中的长期前台命令；这类执行会话结束时，
+Bridge 和它持有的 `caffeinate` 断言会同时消失。LaunchAgent 使用 `RunAtLoad` 和
+`KeepAlive`，登录后自动启动，并在进程异常退出后重新拉起。`status`、`restart`、
+`install --transport ...` 和 `uninstall` 分别用于检查、重启、选择传输和移除服务。为避开
+macOS 对 `Documents` 的后台
+访问限制，服务从 `~/Library/Application Support/CodexQQBridge` 运行；首次安装迁移状态和
+队列，后续安装只更新代码、依赖和 `.env`，保留运行目录中的数据。
 
 ## 故障通知边界
 
@@ -88,6 +99,12 @@ Bridge 会识别 Codex 输出中的网络连接、上游 API、鉴权、限流�
 锁屏不等于睡眠。macOS 的 `scripts/run.sh` 默认使用 `caffeinate -i` 阻止空闲睡眠；用户
 主动睡眠、合盖、关机和断电仍会中断桥接。Windows 需要在系统电源设置中避免运行期间
 自动睡眠。
+
+若锁屏一段时间后 Bridge 进程消失，先运行 `scripts/macos-service.sh status`。状态为
+`Not loaded` 表示 Bridge 没有由 LaunchAgent 管理；不要继续从 Codex 任务中临时启动。
+LaunchAgent 已加载但反复退出时，再检查 `data/logs/launchd.stderr.log`、
+`data/logs/launchd.stdout.log` 和 `data/logs/bridge.jsonl`。LaunchAgent 模式下这里的
+`data` 位于 `~/Library/Application Support/CodexQQBridge`，不是源码目录。
 
 ## 日志位置与查看
 
