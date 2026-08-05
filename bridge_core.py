@@ -557,6 +557,21 @@ class ActiveThread:
                 active_workdir=str(info.workdir),
             )
 
+    def switch_if_current(self, expected_thread_id: str, info: ThreadInfo) -> bool:
+        if not THREAD_ID_RE.fullmatch(info.thread_id):
+            raise ValueError("无效的 Codex Thread UUID")
+        if not info.workdir.is_dir():
+            raise ValueError(f"任务工作目录不存在: {info.workdir}")
+        with self._lock:
+            if self._info.thread_id != expected_thread_id:
+                return False
+            self._info = info
+            self.state.update(
+                active_thread_id=info.thread_id,
+                active_workdir=str(info.workdir),
+            )
+            return True
+
 
 def find_session_file(sessions_dir: Path, thread_id: str) -> Optional[Path]:
     matches = list(sessions_dir.glob(f"**/rollout-*-{thread_id}.jsonl"))

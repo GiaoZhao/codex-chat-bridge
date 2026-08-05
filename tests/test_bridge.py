@@ -577,6 +577,34 @@ class ThreadIndexTests(unittest.TestCase):
             self.assertEqual(stored["active_thread_id"], selected.thread_id)
             self.assertEqual(Path(stored["active_workdir"]), root.resolve())
 
+    def test_active_thread_switch_if_current_is_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            index = self._create_index(root)
+            state = StateStore(root / "state.json")
+            original_id = "00000000-0000-4000-8000-000000000001"
+            config = SimpleNamespace(
+                codex_thread_id=original_id,
+                codex_workdir=root,
+            )
+            active = ActiveThread(config, state, index)
+            replacement = ThreadInfo(
+                "00000000-0000-4000-8000-000000000003",
+                "created task",
+                root,
+            )
+
+            self.assertFalse(
+                active.switch_if_current(
+                    "00000000-0000-4000-8000-000000000002",
+                    replacement,
+                )
+            )
+            self.assertEqual(active.snapshot().thread_id, original_id)
+            self.assertTrue(active.switch_if_current(original_id, replacement))
+            self.assertEqual(active.snapshot(), replacement)
+            self.assertEqual(state.load()["active_thread_id"], replacement.thread_id)
+
 
 class RunnerTests(unittest.TestCase):
     def test_new_thread_command_and_parsing(self) -> None:
@@ -715,6 +743,106 @@ class RunnerTests(unittest.TestCase):
 
 
 class BridgeServiceTests(unittest.TestCase):
+    @staticmethod
+    def _write_session(path: Path, *event_types: str) -> None:
+        path.write_text(
+            "".join(
+                json.dumps({"type": "event_msg", "payload": {"type": event_type}})
+                + "\n"
+                for event_type in event_types
+            ),
+            encoding="utf-8",
+        )
+
+    def test_switches_to_idle_target_while_current_thread_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            current = ThreadInfo(
+                "00000000-0000-4000-8000-000000000001",
+                "running task",
+                root,
+            )
+            target = ThreadInfo(
+                "00000000-0000-4000-8000-000000000002",
+                "finished task",
+                root,
+            )
+            self._write_session(
+                root / f"rollout-current-{current.thread_id}.jsonl",
+                "task_started",
+            )
+            self._write_session(
+                root / f"rollout-target-{target.thread_id}.jsonl",
+                "task_started",
+                "task_complete",
+            )
+            service = BridgeService.__new__(BridgeService)
+            service.config = SimpleNamespace(codex_sessions_dir=root)
+            service.state = StateStore(root / "state.json")
+            service.monitor = SimpleNamespace(
+                path=root / f"rollout-current-{current.thread_id}.jsonl"
+            )
+            service.worker_busy = threading.Event()
+            service.runner = Mock()
+            service.runner.running.return_value = False
+            service.store = Mock()
+            service.store.active_job_count.return_value = 0
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = current
+            service.thread_index = Mock()
+            service.thread_index.get.return_value = target
+            service.thread_choices = {}
+
+            text = service._switch_thread(target.thread_id)
+
+            service.active_thread.switch.assert_called_once_with(target)
+            self.assertIn("已切换", text)
+            self.assertIn("finished task", text)
+
+    def test_rejects_switch_when_target_thread_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            current = ThreadInfo(
+                "00000000-0000-4000-8000-000000000001",
+                "idle task",
+                root,
+            )
+            target = ThreadInfo(
+                "00000000-0000-4000-8000-000000000002",
+                "running task",
+                root,
+            )
+            self._write_session(
+                root / f"rollout-current-{current.thread_id}.jsonl",
+                "task_started",
+                "task_complete",
+            )
+            self._write_session(
+                root / f"rollout-target-{target.thread_id}.jsonl",
+                "task_started",
+            )
+            service = BridgeService.__new__(BridgeService)
+            service.config = SimpleNamespace(codex_sessions_dir=root)
+            service.state = StateStore(root / "state.json")
+            service.monitor = SimpleNamespace(
+                path=root / f"rollout-current-{current.thread_id}.jsonl"
+            )
+            service.worker_busy = threading.Event()
+            service.runner = Mock()
+            service.runner.running.return_value = False
+            service.store = Mock()
+            service.store.active_job_count.return_value = 0
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = current
+            service.thread_index = Mock()
+            service.thread_index.get.return_value = target
+            service.thread_choices = {}
+
+            text = service._switch_thread(target.thread_id)
+
+            service.active_thread.switch.assert_not_called()
+            self.assertEqual(text, "目标任务仍在执行，结束后才能切换。")
+
     def test_all_thread_notification_uses_origin_thread_context(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -767,6 +895,29 @@ class BridgeServiceTests(unittest.TestCase):
                     + "\n"
                 )
             self.assertTrue(service._session_busy_without_checkpoint(path))
+
+    def test_marking_non_current_thread_idle_does_not_clear_current_busy_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            completed_id = "00000000-0000-4000-8000-000000000002"
+            completed_path = root / f"rollout-finished-{completed_id}.jsonl"
+            self._write_session(completed_path, "task_started", "task_complete")
+            service = BridgeService.__new__(BridgeService)
+            service.config = SimpleNamespace(codex_sessions_dir=root)
+            service.state = StateStore(root / "state.json")
+            service.monitor = Mock()
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                "00000000-0000-4000-8000-000000000001",
+                "running task",
+                root,
+            )
+
+            service._mark_thread_idle(completed_id)
+
+            service.monitor.mark_idle.assert_not_called()
+            stored = service.state.load()
+            self.assertEqual(stored["known_idle_session_path"], str(completed_path))
 
     def test_first_stop_waits_and_second_stop_cancels(self) -> None:
         service = BridgeService.__new__(BridgeService)

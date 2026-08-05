@@ -928,7 +928,7 @@ class BridgeService:
                 "/cancel：取消由聊天渠道启动的当前任务",
                 "/help：查看帮助",
                 "桌面任务执行中发送的新消息会自动排队。",
-                "切换或新建任务时，队列必须为空且当前任务必须空闲。",
+                "可随时切换到空闲任务；新建任务不受现有桌面任务状态影响。",
             ]
         )
 
@@ -996,24 +996,13 @@ class BridgeService:
         rows.append([("当前任务", "/current", 0), ("执行状态", "/status", 0)])
         return self._actions(rows)
 
-    def _can_change_thread(self) -> bool:
-        active = self.active_thread.snapshot()
-        path = self.monitor.path or find_session_file(
-            self.config.codex_sessions_dir, active.thread_id
-        )
-        session_is_busy = path is not None and self._session_busy_without_checkpoint(path)
-        return not (
-            self.worker_busy.is_set()
-            or self.runner.running()
-            or session_is_busy
-            or self.store.active_job_count() > 0
-        )
+    def _thread_is_busy(self, thread_id: str) -> bool:
+        path = find_session_file(self.config.codex_sessions_dir, thread_id)
+        return path is not None and self._session_busy_without_checkpoint(path)
 
     def _switch_thread(self, selector: str) -> str:
         if not selector:
             return "用法：/use 编号或完整 UUID"
-        if not self._can_change_thread():
-            return "当前任务或远程队列仍在执行，结束后才能切换。"
         if selector.isdigit():
             listed_thread_id = self.thread_choices.get(int(selector))
             if not listed_thread_id:
@@ -1023,6 +1012,8 @@ class BridgeService:
             info = self.thread_index.get(selector)
         if info is None:
             return "没有找到该任务。先发送 /threads 查看编号。"
+        if self._thread_is_busy(info.thread_id):
+            return "目标任务仍在执行，结束后才能切换。"
         self.active_thread.switch(info)
         lines = [
             f"已切换：{self._short_title(info.title, 60)}",
@@ -1319,13 +1310,6 @@ class BridgeService:
                     event.message_id,
                 )
                 return
-            if not self._can_change_thread():
-                self._safe_send(
-                    recipient,
-                    "当前任务或远程队列仍在执行，结束后才能新建任务。",
-                    event.message_id,
-                )
-                return
             active = self.active_thread.snapshot()
             self._safe_typing(recipient, event.message_id)
             self._accept_remote_job(
@@ -1400,7 +1384,8 @@ class BridgeService:
             size = path.stat().st_size
         except OSError:
             return
-        self.monitor.mark_idle()
+        if self.active_thread.snapshot().thread_id == thread_id:
+            self.monitor.mark_idle()
         self.state.update(
             known_idle_session_path=str(path),
             known_idle_session_size=size,
@@ -1460,38 +1445,39 @@ class BridgeService:
                     "worker",
                     f"claimed job={job_id} action={action} thread={target_thread_id}",
                 )
-                stage = "wait-for-idle"
-                self.store.set_job_status(job_id, "waiting")
-                self._set_worker_state(stage, job_id)
-                path = find_session_file(self.config.codex_sessions_dir, target_thread_id)
-                already_waiting = self.runner.running() or (
-                    path is not None and self._session_busy_without_checkpoint(path)
-                )
-                if already_waiting:
-                    self._safe_send(
-                        self._recipient_from_payload(event),
-                        "当前 Codex 任务仍在执行，本条消息已保存并进入等待队列。",
-                        dedupe_key=f"job:{job_id}:waiting",
+                if action != "new":
+                    stage = "wait-for-idle"
+                    self.store.set_job_status(job_id, "waiting")
+                    self._set_worker_state(stage, job_id)
+                    path = find_session_file(self.config.codex_sessions_dir, target_thread_id)
+                    already_waiting = self.runner.running() or (
+                        path is not None and self._session_busy_without_checkpoint(path)
                     )
-                if not self._wait_until_idle(target_thread_id):
-                    if self.stop_event.is_set():
-                        self.store.set_job_status(job_id, "queued")
-                        log_event("worker", f"deferred during shutdown job={job_id}")
+                    if already_waiting:
+                        self._safe_send(
+                            self._recipient_from_payload(event),
+                            "当前 Codex 任务仍在执行，本条消息已保存并进入等待队列。",
+                            dedupe_key=f"job:{job_id}:waiting",
+                        )
+                    if not self._wait_until_idle(target_thread_id):
+                        if self.stop_event.is_set():
+                            self.store.set_job_status(job_id, "queued")
+                            log_event("worker", f"deferred during shutdown job={job_id}")
+                            continue
+                        error = "等待当前任务结束超时，本条消息未执行。"
+                        result = JobRunResult(target_thread_id, "failed", error, error)
+                        stage = "finalize"
+                        terminal = self._persist_job_result_with_retry(job, result)
+                        if not terminal:
+                            self._set_worker_state("persistence-failed", job_id, error)
+                            continue
+                        self._set_worker_state("failed", job_id, error)
+                        log_event(
+                            "worker",
+                            f"timed out waiting job={job_id} thread={target_thread_id}",
+                            level="ERROR",
+                        )
                         continue
-                    error = "等待当前任务结束超时，本条消息未执行。"
-                    result = JobRunResult(target_thread_id, "failed", error, error)
-                    stage = "finalize"
-                    terminal = self._persist_job_result_with_retry(job, result)
-                    if not terminal:
-                        self._set_worker_state("persistence-failed", job_id, error)
-                        continue
-                    self._set_worker_state("failed", job_id, error)
-                    log_event(
-                        "worker",
-                        f"timed out waiting job={job_id} thread={target_thread_id}",
-                        level="ERROR",
-                    )
-                    continue
                 stage = "prepare-input"
                 self.store.set_job_status(job_id, "preparing")
                 self._set_worker_state(stage, job_id)
@@ -1535,10 +1521,10 @@ class BridgeService:
                     result.error if result.status != "succeeded" else "",
                 )
                 refreshed_thread_id = result.thread_id
-                if action == "new":
-                    refreshed_thread_id = self.active_thread.snapshot().thread_id
-                self._mark_thread_idle(refreshed_thread_id)
-                self._refresh_desktop(refreshed_thread_id, workdir)
+                refresh_result = action != "new" or refreshed_thread_id != target_thread_id
+                if refresh_result:
+                    self._mark_thread_idle(refreshed_thread_id)
+                    self._refresh_desktop(refreshed_thread_id, workdir)
                 log_event(
                     "worker",
                     f"finished job={job_id} status={result.status} "
@@ -1928,12 +1914,17 @@ class BridgeService:
             )
             if new_thread_id:
                 result_thread_id = new_thread_id
-                self.active_thread.switch(
-                    ThreadInfo(new_thread_id, title, workdir.resolve())
+                switched = self.active_thread.switch_if_current(
+                    target_thread_id,
+                    ThreadInfo(new_thread_id, title, workdir.resolve()),
                 )
+                if switched:
+                    created_text = f"已新建并切换任务：{title}"
+                else:
+                    created_text = f"已新建任务：{title}\n当前任务选择保持不变。"
                 self._safe_send(
                     self._recipient_from_payload(event),
-                    f"已新建并切换任务：{title}\n编号：{new_thread_id}",
+                    f"{created_text}\n编号：{new_thread_id}",
                     dedupe_key=f"job:{job_id}:created",
                 )
             elif code == 0:

@@ -762,6 +762,200 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertNotIn("正在继续", outbox.payload["text"])
             self.assertNotIn("已启动", outbox.payload["text"])
 
+    def test_new_is_accepted_while_current_thread_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            current = ThreadInfo(THREAD_ID, "running task", root)
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = current
+            service.worker_busy = threading.Event()
+            service.worker_busy.set()
+            service.runner = Mock()
+            service.runner.running.return_value = True
+            service._safe_typing = Mock()
+            service._accept_remote_job = Mock(return_value=True)
+            event = InboundMessage("qq", "user", "message-new", "/new independent task")
+
+            service._on_channel_event(event)
+
+            service._accept_remote_job.assert_called_once_with(
+                event,
+                action="new",
+                thread_id=THREAD_ID,
+                workdir=root,
+                content="independent task",
+                accepted_text=(
+                    f"已接收并保存，等待 Bridge 在项目 {current.project_name} 中调度新任务。"
+                ),
+            )
+
+    def test_new_job_skips_source_thread_idle_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            new_thread_id = "00000000-0000-4000-8000-000000000002"
+            service = self._service(root)
+            service.config.codex_sessions_dir = root
+            service.config.codex_workdir = root
+            service.worker_busy = threading.Event()
+            service._runtime_lock = threading.Lock()
+            service.worker_stage = "idle"
+            service.current_job_id = ""
+            service.last_worker_error = ""
+            service.runner = Mock()
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                THREAD_ID,
+                "running task",
+                root,
+            )
+            service._wait_until_idle = Mock(return_value=False)
+            service._cleanup_job_attachments = Mock()
+            service._mark_thread_idle = Mock()
+            service._refresh_desktop = Mock()
+            service._run_job = Mock(
+                return_value=JobRunResult(
+                    new_thread_id,
+                    "succeeded",
+                    final_message="done",
+                    event_id="event-new",
+                )
+            )
+
+            def persist(_job: object, _result: JobRunResult) -> bool:
+                service.stop_event.set()
+                return True
+
+            service._persist_job_result_with_retry = Mock(side_effect=persist)
+            payload = {
+                "openid": "user",
+                "action": "new",
+                "thread_id": THREAD_ID,
+                "workdir": str(root),
+                "content": "independent task",
+                "image_paths": [],
+            }
+            job, _created = service.store.enqueue_job("message-new", payload)
+            service.jobs.put_nowait(job.job_id)
+
+            service._worker_loop()
+
+            service._wait_until_idle.assert_not_called()
+            service._run_job.assert_called_once()
+            service._mark_thread_idle.assert_called_once_with(new_thread_id)
+            service._refresh_desktop.assert_called_once_with(new_thread_id, root)
+
+    def test_new_task_does_not_replace_a_later_user_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            new_thread_id = "00000000-0000-4000-8000-000000000002"
+            service = BridgeService.__new__(BridgeService)
+            service.runner = Mock()
+            service.runner.run_new.return_value = (0, new_thread_id, "done", "")
+            service.active_thread = Mock()
+            service.active_thread.switch_if_current.return_value = False
+            service._safe_send = Mock(return_value=True)
+            service._wait_for_rollout_event_id = Mock(return_value="event-new")
+            event = {"openid": "user"}
+
+            result = service._run_job(
+                "job-new",
+                event,
+                "new",
+                THREAD_ID,
+                root,
+                "independent task",
+                [],
+            )
+
+            self.assertEqual(result.thread_id, new_thread_id)
+            service.active_thread.switch_if_current.assert_called_once()
+            created_notice = service._safe_send.call_args.args[1]
+            self.assertIn("当前任务选择保持不变", created_notice)
+
+    def test_new_task_switches_when_source_selection_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            new_thread_id = "00000000-0000-4000-8000-000000000002"
+            service = BridgeService.__new__(BridgeService)
+            service.runner = Mock()
+            service.runner.run_new.return_value = (0, new_thread_id, "done", "")
+            service.active_thread = Mock()
+            service.active_thread.switch_if_current.return_value = True
+            service._safe_send = Mock(return_value=True)
+            service._wait_for_rollout_event_id = Mock(return_value="event-new")
+
+            service._run_job(
+                "job-new",
+                {"openid": "user"},
+                "new",
+                THREAD_ID,
+                root,
+                "independent task",
+                [],
+            )
+
+            expected = ThreadInfo(new_thread_id, "independent task", root.resolve())
+            service.active_thread.switch_if_current.assert_called_once_with(
+                THREAD_ID,
+                expected,
+            )
+            created_notice = service._safe_send.call_args.args[1]
+            self.assertIn("已新建并切换任务", created_notice)
+
+    def test_new_without_created_thread_id_does_not_mark_source_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            service.config.codex_sessions_dir = root
+            service.config.codex_workdir = root
+            service.worker_busy = threading.Event()
+            service._runtime_lock = threading.Lock()
+            service.worker_stage = "idle"
+            service.current_job_id = ""
+            service.last_worker_error = ""
+            service.runner = Mock()
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                THREAD_ID,
+                "running task",
+                root,
+            )
+            service._wait_until_idle = Mock()
+            service._cleanup_job_attachments = Mock()
+            service._mark_thread_idle = Mock()
+            service._refresh_desktop = Mock()
+            service._run_job = Mock(
+                return_value=JobRunResult(
+                    THREAD_ID,
+                    "interrupted",
+                    "missing thread id",
+                    "任务编号缺失",
+                )
+            )
+
+            def persist(_job: object, _result: JobRunResult) -> bool:
+                service.stop_event.set()
+                return True
+
+            service._persist_job_result_with_retry = Mock(side_effect=persist)
+            payload = {
+                "openid": "user",
+                "action": "new",
+                "thread_id": THREAD_ID,
+                "workdir": str(root),
+                "content": "independent task",
+                "image_paths": [],
+            }
+            job, _created = service.store.enqueue_job("message-new-missing-id", payload)
+            service.jobs.put_nowait(job.job_id)
+
+            service._worker_loop()
+
+            service._wait_until_idle.assert_not_called()
+            service._mark_thread_idle.assert_not_called()
+            service._refresh_desktop.assert_not_called()
+
     def test_each_channel_keeps_an_independent_binding(self) -> None:
         service = BridgeService.__new__(BridgeService)
         service.channels = ChannelRegistry(
