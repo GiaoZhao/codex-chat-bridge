@@ -94,8 +94,13 @@ class BridgeServiceRegressionTests(unittest.TestCase):
     def _service(self, root: Path, notify_on_ready: bool) -> BridgeService:
         config = SimpleNamespace(
             base_dir=root,
+            enabled_channels=("qq",),
             qq_allowed_openid="openid",
             qq_bind_code="",
+            qq_reply_chunks=8,
+            qq_reply_chars=1500,
+            qq_attachment_max_bytes=20 * 1024 * 1024,
+            qq_attachment_max_images=3,
             codex_state_db=root / "state.sqlite",
             codex_desktop_refresh=False,
             codex_desktop_cdp_url="http://127.0.0.1:9229",
@@ -103,11 +108,11 @@ class BridgeServiceRegressionTests(unittest.TestCase):
             qq_notify_on_ready=notify_on_ready,
         )
         active = ThreadInfo(THREAD_ID, "current task", root)
-        with patch("bridge.QQApi"), patch("bridge.ThreadIndex"), patch(
+        with patch("qq_channel.QQApi"), patch("bridge.ThreadIndex"), patch(
             "bridge.ActiveThread"
         ) as active_thread, patch("bridge.CodexRunner"), patch(
             "bridge.CodexDesktopRefresher"
-        ), patch("bridge.SessionMonitor"), patch("bridge.QQGatewayClient"):
+        ), patch("bridge.SessionMonitor"), patch("qq_channel.QQGatewayClient"):
             active_thread.return_value.snapshot.return_value = active
             service = BridgeService(config)
         service._safe_send = Mock()
@@ -117,7 +122,7 @@ class BridgeServiceRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             service = self._service(Path(raw_dir), notify_on_ready=False)
             try:
-                service._on_gateway_ready()
+                service._on_channel_ready("qq")
             finally:
                 service.instance_lock.release()
 
@@ -127,8 +132,8 @@ class BridgeServiceRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             service = self._service(Path(raw_dir), notify_on_ready=True)
             try:
-                service._on_gateway_ready()
-                service._on_gateway_ready()
+                service._on_channel_ready("qq")
+                service._on_channel_ready("qq")
             finally:
                 service.instance_lock.release()
 

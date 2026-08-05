@@ -18,7 +18,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 from codex_app_server import AppServerCodexRunner, AppServerProtocolError
 from bridge_core import (
@@ -49,7 +48,21 @@ from bridge_store import (
     OutboxSpec,
     StoredJob,
 )
-from qq_gateway import QQApi, QQGatewayClient, download_c2c_images, websocket
+from channel_factory import (
+    build_channel_registry,
+    channel_configuration_summary,
+    channel_dependency_errors,
+)
+from chat_channel import (
+    ActionRows,
+    ChannelLimits,
+    InboundMessage,
+    Recipient,
+    action_rows,
+    actions_from_payload,
+    actions_to_payload,
+    redact_identifier,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -145,13 +158,6 @@ class BridgeService:
             self.state = StateStore(config.base_dir / "data" / "state.json")
             self.store = BridgeStore(config.base_dir / "data" / "bridge.sqlite3")
             stored_state = self.state.load()
-            self.bound_openid = config.qq_allowed_openid or str(
-                stored_state.get("bound_openid") or ""
-            )
-            if not self.bound_openid and not config.qq_bind_code:
-                raise ValueError("首次运行必须配置 QQ_BIND_CODE，或直接配置 QQ_ALLOWED_OPENID")
-
-            self.api = QQApi(config)
             self.thread_index = ThreadIndex(config.codex_state_db)
             self.active_thread = ActiveThread(config, self.state, self.thread_index)
             self.runner = select_codex_runner(config)
@@ -177,14 +183,13 @@ class BridgeService:
             self._stop_state_lock = threading.Lock()
             self._components_stopped = False
             self._fatal_shutdown_requested = threading.Event()
-            self._online_notice_sent = threading.Event()
+            self._online_notice_sent: set[str] = set()
             self.worker_busy = threading.Event()
             self.outbox_wakeup = threading.Event()
-            self.gateway_ready = threading.Event()
             self._runtime_lock = threading.Lock()
             self._outbox_image_lock = threading.RLock()
-            self.gateway_state = "stopped"
-            self.gateway_detail = ""
+            self.channel_states: Dict[str, str] = {}
+            self.channel_details: Dict[str, str] = {}
             self.worker_stage = "idle"
             self.current_job_id = ""
             self.last_worker_error = ""
@@ -195,17 +200,43 @@ class BridgeService:
             )
             self.outbox_worker = threading.Thread(
                 target=self._outbox_loop,
-                name="qq-outbox",
+                name="chat-outbox",
                 daemon=True,
             )
-            self.gateway = QQGatewayClient(
+            self.channels = build_channel_registry(
                 config,
-                self.api,
-                on_event=self._on_qq_event,
-                on_ready=self._on_gateway_ready,
-                on_state=self._on_gateway_state,
+                on_message=self._on_channel_event,
+                on_ready=self._on_channel_ready,
+                on_state=self._on_channel_state,
             )
-            self._send_lock = threading.Lock()
+            self.channel_threads = {
+                channel.name: threading.Thread(
+                    target=channel.run_forever,
+                    name=f"{channel.name}-gateway",
+                    daemon=True,
+                )
+                for channel in self.channels.values()
+            }
+            stored_bindings = stored_state.get("bindings")
+            if not isinstance(stored_bindings, dict):
+                stored_bindings = {}
+            self.bound_recipients: Dict[str, str] = {}
+            for channel in self.channels.values():
+                raw_binding = stored_bindings.get(channel.name)
+                stored_recipient = ""
+                if isinstance(raw_binding, dict):
+                    stored_recipient = str(raw_binding.get("recipient_id") or "")
+                if not stored_recipient:
+                    stored_recipient = channel.legacy_recipient(stored_state)
+                recipient_id = channel.configured_recipient or stored_recipient
+                if recipient_id:
+                    self.bound_recipients[channel.name] = recipient_id
+                elif not channel.bind_code:
+                    raise ValueError(
+                        f"首次运行必须配置 {channel.name} 绑定码或允许的用户标识"
+                    )
+                self.channel_states[channel.name] = "stopped"
+                self.channel_details[channel.name] = ""
             discarded_outbox = self.store.discard_pending_outbox()
             self._cleanup_unreferenced_outbox_images()
             self._restore_persisted_jobs()
@@ -238,7 +269,9 @@ class BridgeService:
                 self.monitor.start()
                 self.worker.start()
                 self.outbox_worker.start()
-            self.gateway.run_forever()
+                for channel_thread in self.channel_threads.values():
+                    channel_thread.start()
+            self.stop_event.wait()
         finally:
             self.stop(force_if_running=False)
             if self._components_stopped:
@@ -267,11 +300,28 @@ class BridgeService:
             outbox_wakeup = getattr(self, "outbox_wakeup", None)
             if outbox_wakeup is not None:
                 outbox_wakeup.set()
+            channels = getattr(self, "channels", None)
             try:
-                self.gateway.stop()
+                if channels is not None:
+                    channels.stop_all()
             except Exception as exc:
                 clean = False
-                log_event("bridge", f"gateway stop failed: {exc}", level="ERROR")
+                log_event("bridge", f"channel stop failed: {exc}", level="ERROR")
+            channel_threads = getattr(self, "channel_threads", {})
+            for channel_name, channel_thread in channel_threads.items():
+                try:
+                    if (
+                        channel_thread.is_alive()
+                        and threading.current_thread() is not channel_thread
+                    ):
+                        channel_thread.join(timeout=5)
+                except Exception as exc:
+                    clean = False
+                    log_event(
+                        "bridge",
+                        f"{channel_name} gateway stop failed: {exc}",
+                        level="ERROR",
+                    )
             try:
                 if self.worker.is_alive() and threading.current_thread() is not self.worker:
                     if self.runner.running():
@@ -303,6 +353,8 @@ class BridgeService:
                 clean = False
             if outbox_worker is not None and outbox_worker.is_alive():
                 clean = False
+            if any(thread.is_alive() for thread in channel_threads.values()):
+                clean = False
             monitor_thread = getattr(self.monitor, "thread", None)
             if monitor_thread is not None and monitor_thread.is_alive():
                 clean = False
@@ -316,13 +368,13 @@ class BridgeService:
         for job in recoverable:
             self.jobs.put_nowait(job.job_id)
         for job in uncertain:
-            openid = str(job.payload.get("openid") or self._current_openid())
+            recipient = self._recipient_from_payload(job.payload)
             error = "Bridge 在任务启动或执行期间退出，未自动重跑以避免重复执行。"
             self._set_job_status_with_notification(
                 job.job_id,
                 "interrupted",
                 error,
-                openid,
+                recipient,
                 "Bridge 在该任务启动或执行期间退出，无法确认 Codex 是否已经执行。"
                 "为避免重复操作，本任务不会自动重跑，请先检查任务记录后再决定是否重试。",
                 dedupe_key=f"job:{job.job_id}:interrupted",
@@ -341,15 +393,12 @@ class BridgeService:
             if error:
                 self.last_worker_error = error[-400:]
 
-    def _on_gateway_state(self, state: str, detail: str) -> None:
+    def _on_channel_state(self, channel: str, state: str, detail: str) -> None:
         with self._runtime_lock:
-            self.gateway_state = state
-            self.gateway_detail = detail[-400:]
+            self.channel_states[channel] = state
+            self.channel_details[channel] = detail[-400:]
         if state == "ready":
-            self.gateway_ready.set()
             self.outbox_wakeup.set()
-        else:
-            self.gateway_ready.clear()
 
     def _cleanup_job_attachments(self, payload: Dict[str, Any]) -> None:
         raw_dir = str(payload.get("attachment_dir") or "")
@@ -368,121 +417,90 @@ class BridgeService:
                 level="ERROR",
             )
 
-    def _current_openid(self) -> str:
-        return self.config.qq_allowed_openid or self.bound_openid
+    def _current_recipient(self, channel: str) -> Optional[Recipient]:
+        try:
+            configured = self.channels.get(channel).configured_recipient
+        except KeyError:
+            return None
+        bindings = getattr(self, "bound_recipients", {})
+        bound = str(bindings.get(channel) or "") if isinstance(bindings, dict) else ""
+        recipient_id = configured or bound
+        return Recipient(channel, recipient_id) if recipient_id else None
+
+    def _recipient_from_payload(self, payload: Dict[str, Any]) -> Recipient:
+        try:
+            return Recipient.from_payload(payload)
+        except ValueError:
+            for channel in self.channels.names():
+                recipient = self._current_recipient(channel)
+                if recipient is not None:
+                    return recipient
+            raise RuntimeError("任务缺少可用的消息收件人")
+
+    def _bound_destinations(self) -> List[Recipient]:
+        recipients = [
+            self._current_recipient(name) for name in self.channels.names()
+        ]
+        return [recipient for recipient in recipients if recipient is not None]
 
     @staticmethod
-    def _redact_openid(error: object, openid: str) -> str:
-        detail = str(error)
-        if not openid:
-            return detail
-        for value in {openid, quote(openid, safe="")}:
-            if value:
-                detail = detail.replace(value, "[openid]")
-        return detail
+    def _redact_recipient(error: object, recipient_id: str) -> str:
+        return redact_identifier(error, recipient_id)
 
     @staticmethod
-    def _button(label: str, command: str, style: int = 0) -> Dict[str, Any]:
-        return {
-            "id": command,
-            "render_data": {"label": label, "visited_label": label, "style": style},
-            "action": {
-                "type": 2,
-                "permission": {"type": 2},
-                "data": command,
-                "enter": True,
-            },
-        }
+    def _actions(rows: List[List[tuple[str, str, int]]]) -> ActionRows:
+        return action_rows(rows)
 
     @classmethod
-    def _keyboard(cls, rows: List[List[tuple[str, str, int]]]) -> Dict[str, Any]:
-        return {
-            "content": {
-                "rows": [
-                    {
-                        "buttons": [
-                            cls._button(label, command, style)
-                            for label, command, style in row
-                        ]
-                    }
-                    for row in rows
-                    if row
-                ]
-            }
-        }
-
-    @classmethod
-    def _main_keyboard(cls) -> Dict[str, Any]:
-        return cls._keyboard(
+    def _main_actions(cls) -> ActionRows:
+        return cls._actions(
             [
                 [("任务列表", "/threads", 1), ("当前任务", "/current", 0)],
                 [("执行状态", "/status", 0), ("最近结果", "/recent", 0)],
             ]
         )
 
+    @staticmethod
+    def _coerce_recipient(value: Recipient | str, channel: str = "qq") -> Recipient:
+        if isinstance(value, Recipient):
+            return value
+        return Recipient(channel, str(value))
+
+    def _limits_for(self, channel: str) -> ChannelLimits:
+        return self.channels.get(channel).limits
+
     def _send_chunk(
         self,
-        openid: str,
+        recipient: Recipient,
         text: str,
-        msg_id: str = "",
-        keyboard: Optional[Dict[str, Any]] = None,
-        msg_seq: int = 1,
+        reply_to: str = "",
+        actions: ActionRows = (),
+        sequence: int = 1,
     ) -> None:
-        if not openid:
-            return
-        with self._send_lock:
-            try:
-                self.api.send_c2c_markdown(
-                    openid,
-                    text,
-                    msg_id=msg_id,
-                    msg_seq=msg_seq,
-                    keyboard=keyboard,
-                )
-            except Exception as exc:
-                detail = self._redact_openid(exc, openid)
-                log_event("qq-markdown", f"fallback: {detail}", level="WARNING")
-                self.api.send_c2c(openid, text, msg_id=msg_id, msg_seq=msg_seq)
-
-    def _send_text(
-        self,
-        openid: str,
-        text: str,
-        msg_id: str = "",
-        keyboard: Optional[Dict[str, Any]] = None,
-        start_seq: int = 1,
-    ) -> None:
-        max_chunks = self.config.qq_reply_chunks
-        if msg_id:
-            max_chunks = min(max_chunks, max(1, 5 - start_seq))
-        chunks = split_message(text, self.config.qq_reply_chars, max_chunks)
-        last_seq = start_seq + len(chunks) - 1
-        for index, chunk in enumerate(chunks, start_seq):
-            self._send_chunk(
-                openid,
-                chunk,
-                msg_id=msg_id,
-                keyboard=keyboard if index == last_seq else None,
-                msg_seq=index,
-            )
-            if len(chunks) > 1:
-                time.sleep(0.35)
+        channel = self.channels.get(recipient.channel)
+        channel.send_text(
+            recipient.recipient_id,
+            text,
+            reply_to=reply_to,
+            sequence=sequence,
+            actions=actions,
+        )
 
     def _safe_send(
         self,
-        openid: str,
+        recipient: Recipient | str,
         text: str,
-        msg_id: str = "",
-        keyboard: Optional[Dict[str, Any]] = None,
+        reply_to: str = "",
+        actions: ActionRows = (),
         start_seq: int = 1,
         dedupe_key: str = "",
     ) -> bool:
         try:
             items = self._text_outbox_specs(
-                openid,
+                recipient,
                 text,
-                msg_id,
-                keyboard,
+                reply_to,
+                actions,
                 start_seq,
                 dedupe_key,
             )
@@ -492,56 +510,63 @@ class BridgeService:
             self.outbox_wakeup.set()
             return True
         except Exception as exc:
-            log_event("qq-outbox", f"enqueue failed: {exc}", level="ERROR")
+            log_event("chat-outbox", f"enqueue failed: {exc}", level="ERROR")
             return False
 
     def _text_outbox_specs(
         self,
-        openid: str,
+        recipient: Recipient | str,
         text: str,
-        msg_id: str = "",
-        keyboard: Optional[Dict[str, Any]] = None,
+        reply_to: str = "",
+        actions: ActionRows = (),
         start_seq: int = 1,
         dedupe_key: str = "",
     ) -> List[OutboxSpec]:
-        if not openid:
-            return []
-        max_chunks = self.config.qq_reply_chunks
-        if msg_id:
-            max_chunks = min(max_chunks, max(1, 5 - start_seq))
-        chunks = split_message(text, self.config.qq_reply_chars, max_chunks)
+        target = self._coerce_recipient(recipient)
+        limits = self._limits_for(target.channel)
+        max_chunks = limits.reply_chunks
+        if reply_to and limits.passive_reply_limit:
+            max_chunks = min(
+                max_chunks,
+                max(1, limits.passive_reply_limit + 1 - start_seq),
+            )
+        chunks = split_message(text, limits.reply_chars, max_chunks)
         if dedupe_key:
-            group_key = dedupe_key
-        elif msg_id:
+            group_key = f"{target.channel}:{dedupe_key}"
+        elif reply_to:
             fingerprint = hashlib.sha256(
                 json.dumps(
                     {
-                        "openid": openid,
+                        "channel": target.channel,
+                        "recipient_id": target.recipient_id,
                         "text": text,
-                        "msg_id": msg_id,
+                        "reply_to": reply_to,
                         "start_seq": start_seq,
-                        "keyboard": keyboard,
+                        "actions": actions_to_payload(actions),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
                 ).encode("utf-8")
             ).hexdigest()
-            group_key = f"reply:{msg_id}:{fingerprint}"
+            group_key = f"{target.channel}:reply:{reply_to}:{fingerprint}"
         else:
-            group_key = f"notice:{uuid.uuid4().hex}"
+            group_key = f"{target.channel}:notice:{uuid.uuid4().hex}"
         last_seq = start_seq + len(chunks) - 1
         return [
             OutboxSpec(
                 f"{group_key}:chunk:{index}",
                 {
                     "kind": "text",
-                    "openid": openid,
+                    **target.to_payload(),
                     "text": chunk,
-                    "msg_id": msg_id,
-                    "msg_seq": index,
-                    "keyboard": keyboard if index == last_seq else None,
+                    "reply_to": reply_to,
+                    "sequence": index,
+                    "actions": (
+                        actions_to_payload(actions) if index == last_seq else []
+                    ),
                 },
                 group_key,
+                target.channel,
             )
             for index, chunk in enumerate(chunks, start_seq)
         ]
@@ -551,19 +576,19 @@ class BridgeService:
         job_id: str,
         status: str,
         error: str,
-        openid: str,
+        recipient: Recipient,
         text: str,
         *,
         dedupe_key: str,
         process_id: Optional[int] = None,
     ) -> None:
         items = self._text_outbox_specs(
-            openid,
+            recipient,
             text,
             dedupe_key=dedupe_key,
         )
         if not items:
-            raise RuntimeError("任务状态通知缺少 QQ 收件人")
+            raise RuntimeError("任务状态通知缺少聊天渠道收件人")
         self.store.set_job_status_with_outbox(
             job_id,
             status,
@@ -573,31 +598,44 @@ class BridgeService:
         )
         self.outbox_wakeup.set()
 
-    def _safe_typing(self, openid: str, msg_id: str) -> None:
+    def _safe_typing(self, recipient: Recipient, reply_to: str) -> None:
         try:
-            self.api.send_c2c_typing(openid, msg_id, seconds=60)
+            self.channels.get(recipient.channel).send_typing(
+                recipient.recipient_id,
+                reply_to,
+            )
         except Exception as exc:
             log_event(
-                "qq-typing",
-                self._redact_openid(exc, openid),
+                f"{recipient.channel}-typing",
+                self.channels.get(recipient.channel).redact_error(
+                    exc,
+                    recipient.recipient_id,
+                ),
                 level="WARNING",
             )
 
     def _safe_send_images(
         self,
-        openid: str,
+        recipient: Recipient | str,
         paths: List[Path],
         dedupe_key: str = "",
     ) -> bool:
+        target = self._coerce_recipient(recipient)
+        if not self._limits_for(target.channel).supports_outbound_images:
+            return not paths
         with self._outbox_image_lock:
-            items, success = self._image_outbox_specs(openid, paths, dedupe_key)
+            items, success = self._image_outbox_specs(target, paths, dedupe_key)
             if items:
                 try:
                     self.store.enqueue_outbox_batch(items)
                     self.outbox_wakeup.set()
                 except Exception as exc:
                     success = False
-                    log_event("qq-image", f"enqueue failed: {exc}", level="ERROR")
+                    log_event(
+                        f"{target.channel}-image",
+                        f"enqueue failed: {exc}",
+                        level="ERROR",
+                    )
                 finally:
                     self._cleanup_unreferenced_outbox_images()
             return success
@@ -670,18 +708,26 @@ class BridgeService:
 
     def _image_outbox_specs(
         self,
-        openid: str,
+        recipient: Recipient | str,
         paths: List[Path],
         dedupe_key: str = "",
     ) -> tuple[List[OutboxSpec], bool]:
+        target = self._coerce_recipient(recipient)
+        limits = self._limits_for(target.channel)
+        if not limits.supports_outbound_images:
+            return [], not paths
         success = True
-        group_key = dedupe_key or f"image:{uuid.uuid4().hex}"
+        group_key = (
+            f"{target.channel}:{dedupe_key}"
+            if dedupe_key
+            else f"{target.channel}:image:{uuid.uuid4().hex}"
+        )
         items: List[OutboxSpec] = []
         for index, path in enumerate(paths, 1):
             try:
-                if path.stat().st_size > self.config.qq_attachment_max_bytes:
+                if path.stat().st_size > limits.attachment_max_bytes:
                     log_event(
-                        "qq-image",
+                        f"{target.channel}-image",
                         f"skipped oversized image: {path.name}",
                         level="WARNING",
                     )
@@ -689,45 +735,49 @@ class BridgeService:
                 spooled_path = self._spool_outbox_image(path, group_key, index)
                 payload = {
                     "kind": "image",
-                    "openid": openid,
+                    **target.to_payload(),
                     "path": str(spooled_path),
-                    "msg_seq": index,
+                    "sequence": index,
                 }
                 item_key = (
-                    f"{dedupe_key}:image:{index}"
+                    f"{target.channel}:{dedupe_key}:image:{index}"
                     if dedupe_key
                     else f"{group_key}:item:{index}"
                 )
-                items.append(OutboxSpec(item_key, payload, group_key))
+                items.append(
+                    OutboxSpec(item_key, payload, group_key, target.channel)
+                )
             except Exception as exc:
                 success = False
-                log_event("qq-image", f"{path.name}: {exc}", level="ERROR")
+                log_event(
+                    f"{target.channel}-image",
+                    f"{path.name}: {exc}",
+                    level="ERROR",
+                )
         return items, success
 
     def _deliver_outbox(self, item: OutboxItem) -> None:
         payload = item.payload
         kind = str(payload.get("kind") or "")
-        openid = str(payload.get("openid") or "")
+        recipient = Recipient.from_payload(payload, default_channel=item.channel)
+        channel = self.channels.get(recipient.channel)
         if kind == "text":
-            raw_keyboard = payload.get("keyboard")
-            keyboard = raw_keyboard if isinstance(raw_keyboard, dict) else None
-            self._send_chunk(
-                openid,
+            channel.send_text(
+                recipient.recipient_id,
                 str(payload.get("text") or ""),
-                msg_id=str(payload.get("msg_id") or ""),
-                msg_seq=int(payload.get("msg_seq") or 1),
-                keyboard=keyboard,
+                reply_to=str(payload.get("reply_to") or ""),
+                sequence=int(payload.get("sequence") or 1),
+                actions=actions_from_payload(payload.get("actions")),
             )
             return
         if kind == "image":
             path = Path(str(payload.get("path") or ""))
             if not path.is_file():
                 raise FileNotFoundError(f"待发送图片不存在: {path.name}")
-            file_info = self.api.upload_c2c_image(openid, path)
-            self.api.send_c2c_media(
-                openid,
-                file_info,
-                msg_seq=int(payload.get("msg_seq") or 1),
+            channel.send_image(
+                recipient.recipient_id,
+                path,
+                sequence=int(payload.get("sequence") or 1),
             )
             return
         raise ValueError(f"未知 outbox 类型: {kind}")
@@ -735,11 +785,12 @@ class BridgeService:
     def _outbox_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                if not self.gateway_ready.is_set():
+                ready_channels = self.channels.ready_names()
+                if not ready_channels:
                     self.outbox_wakeup.wait(1)
                     self.outbox_wakeup.clear()
                     continue
-                item = self.store.claim_due_outbox()
+                item = self.store.claim_due_outbox(channels=ready_channels)
                 if item is None:
                     self.outbox_wakeup.wait(1)
                     self.outbox_wakeup.clear()
@@ -748,11 +799,18 @@ class BridgeService:
                     self._deliver_outbox(item)
                 except Exception as exc:
                     delay = min(300, max(2, 2 ** min(item.attempts + 1, 8)))
-                    openid = str(item.payload.get("openid") or "")
-                    detail = self._redact_openid(exc, openid)
+                    recipient_id = str(
+                        item.payload.get("recipient_id")
+                        or item.payload.get("openid")
+                        or ""
+                    )
+                    detail = self.channels.get(item.channel).redact_error(
+                        exc,
+                        recipient_id,
+                    )
                     log_event(
-                        "qq-outbox",
-                        f"delivery failed id={item.outbox_id} "
+                        "chat-outbox",
+                        f"delivery failed channel={item.channel} id={item.outbox_id} "
                         f"retry_in={delay}s error={detail}",
                         level="ERROR",
                     )
@@ -762,52 +820,61 @@ class BridgeService:
                     self.store.mark_outbox_sent(item.outbox_id)
                     if item.payload.get("kind") == "image":
                         self._cleanup_unreferenced_outbox_images()
-                    log_event("qq-outbox", f"delivered id={item.outbox_id}")
+                    log_event(
+                        "chat-outbox",
+                        f"delivered channel={item.channel} id={item.outbox_id}",
+                    )
                     time.sleep(0.35)
             except Exception as exc:
                 log_event(
-                    "qq-outbox",
+                    "chat-outbox",
                     f"worker recovered from storage error: {exc}",
                     level="ERROR",
                 )
                 self.stop_event.wait(2)
 
-    def _on_gateway_ready(self) -> None:
-        self._on_gateway_state("ready", "")
-        log_event("bridge", "QQ Gateway is ready")
-        if not self.config.qq_notify_on_ready:
+    def _on_channel_ready(self, channel_name: str) -> None:
+        self._on_channel_state(channel_name, "ready", "")
+        log_event("bridge", f"{channel_name} channel is ready")
+        channel = self.channels.get(channel_name)
+        if not channel.notify_on_ready:
             return
-        openid = self._current_openid()
-        if openid:
-            if self._online_notice_sent.is_set():
+        recipient = self._current_recipient(channel_name)
+        if recipient:
+            if channel_name in self._online_notice_sent:
                 return
             active = self.active_thread.snapshot()
             queued = self._safe_send(
-                openid,
+                recipient,
                 "## Codex Chat Bridge 已上线\n\n"
                 f"当前任务：**{self._short_title(active.title)}**",
-                keyboard=self._main_keyboard(),
+                actions=self._main_actions(),
             )
             if queued:
-                self._online_notice_sent.set()
+                self._online_notice_sent.add(channel_name)
         else:
-            log_event("bridge", "waiting for /bind <code>")
+            log_event("bridge", f"{channel_name} waiting for /bind <code>")
 
-    def _bind(self, event: Dict[str, Any]) -> None:
-        content = event["content"]
+    def _bind(self, event: InboundMessage) -> None:
+        content = event.content
         supplied = content.partition(" ")[2].strip()
-        if not supplied or not hmac.compare_digest(supplied, self.config.qq_bind_code):
-            self._safe_send(event["openid"], "绑定码不正确。", event["message_id"])
+        channel = self.channels.get(event.channel)
+        if not supplied or not hmac.compare_digest(supplied, channel.bind_code):
+            self._safe_send(event.recipient, "绑定码不正确。", event.message_id)
             return
-        self.bound_openid = event["openid"]
-        self.state.update(bound_openid=self.bound_openid)
+        self.bound_recipients[event.channel] = event.sender_id
+        bindings = {
+            name: {"recipient_id": recipient_id}
+            for name, recipient_id in self.bound_recipients.items()
+        }
+        self.state.update(bindings=bindings)
         self._safe_send(
-            self.bound_openid,
+            event.recipient,
             "绑定成功。此机器人现在只接受你的私聊消息。发送 /help 查看命令。",
-            event["message_id"],
-            keyboard=self._main_keyboard(),
+            event.message_id,
+            actions=self._main_actions(),
         )
-        log_event("bridge", "QQ user binding completed")
+        log_event("bridge", f"{event.channel} user binding completed")
 
     def _status_text(self) -> str:
         active = self.active_thread.snapshot()
@@ -819,7 +886,7 @@ class BridgeService:
         pending_notifications = self.store.pending_outbox_count()
         latest_job = self.store.latest_job()
         with self._runtime_lock:
-            gateway_state = self.gateway_state
+            channel_states = dict(self.channel_states)
             worker_stage = self.worker_stage
             last_worker_error = self.last_worker_error
         safe_error = ""
@@ -835,7 +902,11 @@ class BridgeService:
                 f"Worker 阶段：{worker_stage}",
                 f"最近任务状态：{latest_job.status if latest_job else '无'}",
                 f"持久任务：{queue_size}",
-                f"QQ Gateway：{gateway_state}",
+                "渠道："
+                + "，".join(
+                    f"{name}={channel_states.get(name, 'unknown')}"
+                    for name in self.channels.names()
+                ),
                 f"待发送通知：{pending_notifications}",
                 f"最近执行错误：{safe_error or '无'}",
                 f"会话文件：{'已找到' if path else '未找到'}",
@@ -854,7 +925,7 @@ class BridgeService:
                 "/new <第一条消息>：在当前项目中新建任务",
                 "/status：查看任务和队列状态",
                 "/recent：查看最近一次 Codex 最终结果",
-                "/cancel：取消由 QQ 启动的当前任务",
+                "/cancel：取消由聊天渠道启动的当前任务",
                 "/help：查看帮助",
                 "桌面任务执行中发送的新消息会自动排队。",
                 "切换或新建任务时，队列必须为空且当前任务必须空闲。",
@@ -897,7 +968,7 @@ class BridgeService:
             lines.append(f"下一页：/threads {page + 1}")
         return "\n".join(lines)
 
-    def _threads_keyboard(self, page: int) -> Dict[str, Any]:
+    def _threads_actions(self, page: int) -> ActionRows:
         page_size = 8
         threads, total = self.thread_index.list_page(page, page_size)
         start = (page - 1) * page_size
@@ -923,7 +994,7 @@ class BridgeService:
         if navigation:
             rows.append(navigation)
         rows.append([("当前任务", "/current", 0), ("执行状态", "/status", 0)])
-        return self._keyboard(rows)
+        return self._actions(rows)
 
     def _can_change_thread(self) -> bool:
         active = self.active_thread.snapshot()
@@ -942,7 +1013,7 @@ class BridgeService:
         if not selector:
             return "用法：/use 编号或完整 UUID"
         if not self._can_change_thread():
-            return "当前任务或 QQ 队列仍在执行，结束后才能切换。"
+            return "当前任务或远程队列仍在执行，结束后才能切换。"
         if selector.isdigit():
             listed_thread_id = self.thread_choices.get(int(selector))
             if not listed_thread_id:
@@ -978,12 +1049,15 @@ class BridgeService:
             lines.extend(["", "该任务暂时没有完整的本地对话记录。"])
         return "\n".join(lines)
 
-    def _persist_inbound_images(self, event: Dict[str, Any]) -> tuple[List[Path], str]:
-        attachments = event.get("attachments") or []
+    def _persist_inbound_images(
+        self,
+        event: InboundMessage,
+    ) -> tuple[List[Path], str]:
+        attachments = event.attachments
         if not attachments:
             return [], ""
-        message_id = str(event["message_id"])
-        directory_name = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+        event_key = f"{event.channel}:{event.message_id}"
+        directory_name = hashlib.sha256(event_key.encode("utf-8")).hexdigest()
         root = self.config.base_dir / "data" / "attachments"
         target = root / directory_name
         if target.is_dir():
@@ -993,11 +1067,9 @@ class BridgeService:
         root.mkdir(parents=True, exist_ok=True)
         staging = root / f".{directory_name}-{uuid.uuid4().hex}.tmp"
         try:
-            paths = download_c2c_images(
+            paths = self.channels.get(event.channel).download_images(
                 attachments,
                 staging,
-                self.config.qq_attachment_max_bytes,
-                self.config.qq_attachment_max_images,
             )
             if not paths:
                 raise ValueError("消息中没有可处理的图片")
@@ -1012,7 +1084,7 @@ class BridgeService:
 
     def _accept_remote_job(
         self,
-        event: Dict[str, Any],
+        event: InboundMessage,
         *,
         action: str,
         thread_id: str,
@@ -1023,11 +1095,12 @@ class BridgeService:
         if self.stop_event.is_set():
             log_event("bridge", "ignored remote job during shutdown")
             return False
-        message_id = str(event["message_id"])
-        existing = self.store.get_job_by_message(message_id)
+        message_id = event.message_id
+        event_key = f"{event.channel}:{message_id}"
+        existing = self.store.get_job_by_message(event_key)
         if existing is not None:
             self._safe_send(
-                str(event["openid"]),
+                event.recipient,
                 accepted_text,
                 message_id,
                 start_seq=2,
@@ -1045,7 +1118,7 @@ class BridgeService:
                 log_event("bridge", "deferred remote job acceptance during shutdown")
                 return False
             payload: Dict[str, Any] = {
-                "openid": str(event["openid"]),
+                **event.recipient.to_payload(),
                 "message_id": message_id,
                 "content": content,
                 "action": action,
@@ -1054,12 +1127,12 @@ class BridgeService:
                 "image_paths": [str(path.resolve()) for path in image_paths],
                 "attachment_dir": attachment_dir,
             }
-            job, created = self.store.enqueue_job(message_id, payload, max_active=20)
+            job, created = self.store.enqueue_job(event_key, payload, max_active=20)
         except OverflowError:
             if attachment_dir:
                 self._cleanup_job_attachments({"attachment_dir": attachment_dir})
             self._safe_send(
-                str(event["openid"]),
+                event.recipient,
                 "远程任务队列已满，请稍后再试。",
                 message_id,
                 start_seq=2,
@@ -1071,7 +1144,7 @@ class BridgeService:
             detail = summarize_codex_error(str(exc), max_chars=300)
             safe_detail, _images = qq_safe_final(detail, workdir, max_images=0)
             self._safe_send(
-                str(event["openid"]),
+                event.recipient,
                 f"消息保存失败，本条任务未进入队列：\n{safe_detail}",
                 message_id,
                 start_seq=2,
@@ -1085,7 +1158,7 @@ class BridgeService:
                 f"accepted job={job.job_id} action={action} thread={thread_id}",
             )
         self._safe_send(
-            str(event["openid"]),
+            event.recipient,
             accepted_text,
             message_id,
             start_seq=2,
@@ -1093,44 +1166,65 @@ class BridgeService:
         )
         return True
 
-    def _on_qq_event(self, event: Dict[str, Any]) -> None:
+    def _safe_final_for_recipient(
+        self,
+        message: str,
+        workdir: Path,
+        recipient: Recipient,
+    ) -> tuple[str, List[Path]]:
+        limits = self._limits_for(recipient.channel)
+        max_images = (
+            limits.attachment_max_images if limits.supports_outbound_images else 0
+        )
+        return qq_safe_final(message, workdir, max_images=max_images)
+
+    def _on_channel_event(self, event: InboundMessage) -> None:
         if self.stop_event.is_set():
-            log_event("bridge", "ignored QQ event during shutdown")
+            log_event("bridge", f"ignored {event.channel} event during shutdown")
             return
-        openid = event["openid"]
-        content = event["content"].strip()
-        if not self._current_openid():
+        recipient = event.recipient
+        content = event.content.strip()
+        bound = self._current_recipient(event.channel)
+        if bound is None:
             if content.startswith("/bind "):
                 self._bind(event)
             else:
-                self._safe_send(openid, "请先发送：/bind 你的绑定码", event["message_id"])
+                self._safe_send(
+                    recipient,
+                    "请先发送：/bind 你的绑定码",
+                    event.message_id,
+                )
             return
-        if openid != self._current_openid():
-            log_event("bridge", "blocked message from unbound QQ user", level="WARNING")
+        if recipient != bound:
+            log_event(
+                "bridge",
+                f"blocked message from unbound {event.channel} user",
+                level="WARNING",
+            )
             return
 
         parts = content.split(None, 1)
         command = parts[0].lower() if parts else ""
         argument = parts[1].strip() if len(parts) > 1 else ""
         if command == "/bind":
-            self._safe_send(openid, "当前 QQ 已绑定。", event["message_id"])
+            self._safe_send(recipient, "当前渠道已绑定。", event.message_id)
             return
         if command == "/status":
             self._safe_send(
-                openid,
+                recipient,
                 self._status_text(),
-                event["message_id"],
-                keyboard=self._keyboard(
+                event.message_id,
+                actions=self._actions(
                     [[("当前任务", "/current", 0), ("取消任务", "/cancel", 2)]]
                 ),
             )
             return
         if command == "/help":
             self._safe_send(
-                openid,
+                recipient,
                 self._help_text(),
-                event["message_id"],
-                keyboard=self._main_keyboard(),
+                event.message_id,
+                actions=self._main_actions(),
             )
             return
         if command == "/threads":
@@ -1144,38 +1238,43 @@ class BridgeService:
             except Exception as exc:
                 log_event("thread-index", str(exc), level="ERROR")
                 text = "暂时无法读取本机 Codex 任务列表。"
-            keyboard = None
+            actions: ActionRows = ()
             if not text.startswith("用法") and not text.startswith("暂时"):
-                keyboard = self._threads_keyboard(page)
-            self._safe_send(openid, text, event["message_id"], keyboard=keyboard)
+                actions = self._threads_actions(page)
+            self._safe_send(
+                recipient,
+                text,
+                event.message_id,
+                actions=actions,
+            )
             return
         if command == "/use":
             try:
                 text = self._switch_thread(argument)
                 active = self.active_thread.snapshot()
-                text, images = qq_safe_final(
+                text, images = self._safe_final_for_recipient(
                     text,
                     active.workdir,
-                    self.config.qq_attachment_max_images,
+                    recipient,
                 )
             except Exception as exc:
                 log_event("thread-switch", str(exc), level="ERROR")
                 text = f"切换失败：{exc}"
                 images = []
             self._safe_send(
-                openid,
+                recipient,
                 text,
-                event["message_id"],
-                keyboard=self._main_keyboard(),
+                event.message_id,
+                actions=self._main_actions(),
             )
-            self._safe_send_images(openid, images)
+            self._safe_send_images(recipient, images)
             return
         if command == "/current":
             self._safe_send(
-                openid,
+                recipient,
                 self._current_text(),
-                event["message_id"],
-                keyboard=self._main_keyboard(),
+                event.message_id,
+                actions=self._main_actions(),
             )
             return
         if command == "/recent":
@@ -1183,43 +1282,52 @@ class BridgeService:
             path = find_session_file(self.config.codex_sessions_dir, active.thread_id)
             latest = latest_final_message(path) if path else None
             if latest:
-                text, images = qq_safe_final(
+                text, images = self._safe_final_for_recipient(
                     latest,
                     active.workdir,
-                    self.config.qq_attachment_max_images,
+                    recipient,
                 )
-                self._safe_send(openid, text, event["message_id"], keyboard=self._main_keyboard())
-                self._safe_send_images(openid, images)
+                self._safe_send(
+                    recipient,
+                    text,
+                    event.message_id,
+                    actions=self._main_actions(),
+                )
+                self._safe_send_images(recipient, images)
             else:
                 self._safe_send(
-                    openid,
+                    recipient,
                     "当前会话还没有最终结果。",
-                    event["message_id"],
-                    keyboard=self._main_keyboard(),
+                    event.message_id,
+                    actions=self._main_actions(),
                 )
             return
         if command == "/cancel":
             cancelled = self.runner.cancel()
-            message = "已请求取消 QQ 启动的当前任务。" if cancelled else "当前没有可取消的 QQ 任务。"
-            self._safe_send(openid, message, event["message_id"])
+            message = (
+                "已请求取消聊天渠道启动的当前任务。"
+                if cancelled
+                else "当前没有可取消的聊天渠道任务。"
+            )
+            self._safe_send(recipient, message, event.message_id)
             return
         if command == "/new":
             if not argument:
                 self._safe_send(
-                    openid,
+                    recipient,
                     "用法：/new 新任务的第一条消息",
-                    event["message_id"],
+                    event.message_id,
                 )
                 return
             if not self._can_change_thread():
                 self._safe_send(
-                    openid,
-                    "当前任务或 QQ 队列仍在执行，结束后才能新建任务。",
-                    event["message_id"],
+                    recipient,
+                    "当前任务或远程队列仍在执行，结束后才能新建任务。",
+                    event.message_id,
                 )
                 return
             active = self.active_thread.snapshot()
-            self._safe_typing(openid, event["message_id"])
+            self._safe_typing(recipient, event.message_id)
             self._accept_remote_job(
                 event,
                 action="new",
@@ -1232,20 +1340,28 @@ class BridgeService:
             )
             return
         if content.startswith("/"):
-            self._safe_send(openid, "未知命令。发送 /help 查看可用命令。", event["message_id"])
+            self._safe_send(
+                recipient,
+                "未知命令。发送 /help 查看可用命令。",
+                event.message_id,
+            )
             return
 
-        attachments = event.get("attachments") or []
+        attachments = event.attachments
         if attachments and not any(
             str(item.get("content_type") or "").startswith("image/")
             for item in attachments
             if isinstance(item, dict)
         ):
-            self._safe_send(openid, "当前只支持接收图片附件。", event["message_id"])
+            self._safe_send(
+                recipient,
+                "当前只支持接收图片附件。",
+                event.message_id,
+            )
             return
 
         active = self.active_thread.snapshot()
-        self._safe_typing(openid, event["message_id"])
+        self._safe_typing(recipient, event.message_id)
         self._accept_remote_job(
             event,
             action="resume",
@@ -1353,7 +1469,7 @@ class BridgeService:
                 )
                 if already_waiting:
                     self._safe_send(
-                        str(event["openid"]),
+                        self._recipient_from_payload(event),
                         "当前 Codex 任务仍在执行，本条消息已保存并进入等待队列。",
                         dedupe_key=f"job:{job_id}:waiting",
                     )
@@ -1518,18 +1634,18 @@ class BridgeService:
             if not result.event_id:
                 raise RuntimeError("成功任务缺少可去重的会话事件标识")
             thread = self._thread_info_for_job_result(job, result)
-            openid = str(job.payload.get("openid") or self._current_openid())
+            recipient = self._recipient_from_payload(job.payload)
             dedupe_key = f"session-final:{result.event_id}"
             with self._outbox_image_lock:
                 items = self._final_outbox_specs(
-                    openid,
+                    recipient,
                     thread,
                     result.final_message,
                     dedupe_key,
                     question=str(job.payload.get("content") or "").strip(),
                 )
                 if not items:
-                    raise RuntimeError("成功任务通知缺少 QQ 收件人")
+                    raise RuntimeError("成功任务通知缺少聊天渠道收件人")
                 self.store.set_job_status_with_outbox(
                     job.job_id,
                     "succeeded",
@@ -1549,7 +1665,7 @@ class BridgeService:
             job.job_id,
             result.status,
             result.error,
-            str(job.payload.get("openid") or self._current_openid()),
+            self._recipient_from_payload(job.payload),
             result.notification,
             dedupe_key=dedupe_key,
         )
@@ -1598,7 +1714,7 @@ class BridgeService:
                 job_id,
                 "running",
                 "",
-                str(event["openid"]),
+                self._recipient_from_payload(event),
                 message,
                 dedupe_key=f"job:{job_id}:started",
                 process_id=process_id,
@@ -1680,7 +1796,7 @@ class BridgeService:
             level="WARNING",
         )
         self._safe_send(
-            str(event["openid"]),
+            self._recipient_from_payload(event),
             f"{message}\n\n任务尚未结束；最终成功或失败后会继续通知。",
             dedupe_key=f"job:{job_id}:diagnostic:{category}",
         )
@@ -1816,13 +1932,13 @@ class BridgeService:
                     ThreadInfo(new_thread_id, title, workdir.resolve())
                 )
                 self._safe_send(
-                    event["openid"],
+                    self._recipient_from_payload(event),
                     f"已新建并切换任务：{title}\n编号：{new_thread_id}",
                     dedupe_key=f"job:{job_id}:created",
                 )
             elif code == 0:
                 self._safe_send(
-                    event["openid"],
+                    self._recipient_from_payload(event),
                     "任务已执行，但没有解析到新任务编号，因此未切换当前任务。",
                     dedupe_key=f"job:{job_id}:missing-thread-id",
                 )
@@ -1939,21 +2055,25 @@ class BridgeService:
         event_id: str = "",
         question: str = "",
     ) -> None:
-        openid = self._current_openid()
-        if not openid:
+        recipients = self._bound_destinations()
+        if not recipients:
             return
         dedupe_key = f"session-final:{event_id}" if event_id else ""
         with self._outbox_image_lock:
             try:
-                items = self._final_outbox_specs(
-                    openid,
-                    thread,
-                    message,
-                    dedupe_key,
-                    question,
-                )
+                items: List[OutboxSpec] = []
+                for recipient in recipients:
+                    items.extend(
+                        self._final_outbox_specs(
+                            recipient,
+                            thread,
+                            message,
+                            dedupe_key,
+                            question,
+                        )
+                    )
                 if not items:
-                    raise RuntimeError("Codex 最终结果通知缺少 QQ 收件人")
+                    raise RuntimeError("Codex 最终结果通知缺少聊天渠道收件人")
                 self.store.enqueue_outbox_batch(items)
             finally:
                 self._cleanup_unreferenced_outbox_images()
@@ -1961,17 +2081,23 @@ class BridgeService:
 
     def _prepare_final_notification(
         self,
+        recipient: Recipient,
         thread: ThreadInfo,
         message: str,
         question: str = "",
-    ) -> tuple[str, Dict[str, Any], List[Path]]:
-        text, images = qq_safe_final(
+    ) -> tuple[str, ActionRows, List[Path]]:
+        text, images = self._safe_final_for_recipient(
             message,
             thread.workdir,
-            self.config.qq_attachment_max_images,
+            recipient,
         )
         title = self._short_title(thread.title, 60)
-        body = text or "Codex 已返回图片。"
+        if text:
+            body = text
+        elif images:
+            body = "Codex 已返回图片。"
+        else:
+            body = "Codex 返回了本地图片，请在 Desktop 中查看。"
         safe_question = ""
         if question.strip():
             safe_question, _question_images = qq_safe_final(
@@ -2004,35 +2130,36 @@ class BridgeService:
             )
         lines.extend(["", body])
         notification = "\n".join(lines)
-        keyboard = self._keyboard(
+        actions = self._actions(
             [
                 [("切换到此任务", f"/use {thread.thread_id}", 1)],
                 [("任务列表", "/threads", 0), ("当前任务", "/current", 0)],
             ]
         )
-        return notification, keyboard, images
+        return notification, actions, images
 
     def _final_outbox_specs(
         self,
-        openid: str,
+        recipient: Recipient,
         thread: ThreadInfo,
         message: str,
         dedupe_key: str,
         question: str = "",
     ) -> List[OutboxSpec]:
-        notification, keyboard, images = self._prepare_final_notification(
+        notification, actions, images = self._prepare_final_notification(
+            recipient,
             thread,
             message,
             question,
         )
         items = self._text_outbox_specs(
-            openid,
+            recipient,
             notification,
-            keyboard=keyboard,
+            actions=actions,
             dedupe_key=dedupe_key,
         )
         image_items, complete = self._image_outbox_specs(
-            openid,
+            recipient,
             images,
             dedupe_key=dedupe_key,
         )
@@ -2041,8 +2168,8 @@ class BridgeService:
         return [*items, *image_items]
 
     def _on_interrupted(self, thread: ThreadInfo, detail: str, event_id: str) -> None:
-        openid = self._current_openid()
-        if not openid:
+        recipients = self._bound_destinations()
+        if not recipients:
             return
         safe_detail, _images = qq_safe_final(detail, thread.workdir, max_images=0)
         title = self._short_title(thread.title, 60)
@@ -2056,11 +2183,15 @@ class BridgeService:
                 safe_detail,
             ]
         )
-        if not self._safe_send(
-            openid,
-            notification,
-            dedupe_key=f"session-interrupted:{event_id}",
-        ):
+        queued = [
+            self._safe_send(
+                recipient,
+                notification,
+                dedupe_key=f"session-interrupted:{event_id}",
+            )
+            for recipient in recipients
+        ]
+        if not all(queued):
             raise RuntimeError("无法将 Codex 中断事件写入通知队列")
 
 
@@ -2078,8 +2209,7 @@ def check_installation(config: Config) -> int:
         ThreadIndex(config.codex_state_db).list_page(1, 1)
     except Exception as exc:
         errors.append(f"Codex 任务索引读取失败: {exc}")
-    if websocket is None:
-        errors.append("缺少 Python 依赖 websocket-client")
+    errors.extend(channel_dependency_errors(config.enabled_channels))
     try:
         runner = select_codex_runner(config)
         transport = getattr(runner, "transport_name", "exec")
@@ -2112,23 +2242,24 @@ def check_installation(config: Config) -> int:
     print(f"Thread: {thread_id}")
     print(f"Session: {path or 'not found'}")
     print(f"State DB: {config.codex_state_db}")
-    print(f"QQ AppID: {'configured' if config.qq_app_id else 'missing'}")
-    print(f"QQ binding: {'configured' if config.qq_allowed_openid or config.qq_bind_code else 'missing'}")
+    print(f"Channels: {','.join(config.enabled_channels)}")
+    for line in channel_configuration_summary(config, config.enabled_channels):
+        print(line)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("Local check passed. Network and QQ credentials have not been tested.")
+    print("Local check passed. Network and channel credentials have not been tested.")
     return 0
 
 
 def main() -> int:
     configure_log_file(BASE_DIR / "data" / "logs" / "bridge.jsonl")
-    parser = argparse.ArgumentParser(description="Bridge Codex Desktop tasks to QQ")
+    parser = argparse.ArgumentParser(description="Bridge Codex Desktop tasks to chat channels")
     parser.add_argument("--check", action="store_true", help="validate local configuration only")
     args = parser.parse_args()
     try:
-        config = Config.from_env(BASE_DIR, require_qq=True)
+        config = Config.from_env(BASE_DIR, require_channel_credentials=True)
     except ValueError as exc:
         log_event("bridge", f"configuration error: {exc}", level="ERROR")
         print(f"配置错误：{exc}", file=sys.stderr)

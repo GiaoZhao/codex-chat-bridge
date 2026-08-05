@@ -30,6 +30,7 @@ from bridge_core import (
     summarize_codex_error,
 )
 from bridge import BridgeService
+from chat_channel import ChannelLimits, ChannelRegistry, Recipient
 from qq_gateway import QQApi, clean_message_content, download_c2c_images, extract_c2c_event
 
 
@@ -723,17 +724,22 @@ class BridgeServiceTests(unittest.TestCase):
                 root,
             )
             service = BridgeService.__new__(BridgeService)
-            service.config = SimpleNamespace(qq_attachment_max_images=3)
+            channel = SimpleNamespace(
+                name="qq",
+                limits=ChannelLimits(1500, 8, 20 * 1024 * 1024, 3, 4),
+            )
+            service.channels = ChannelRegistry([channel])
             with patch("bridge.qq_safe_final", return_value=("result", [])) as safe_final:
-                notification, keyboard, images = service._prepare_final_notification(
+                notification, actions, images = service._prepare_final_notification(
+                    Recipient("qq", "user"),
                     thread,
                     "raw result",
                 )
-            safe_final.assert_called_once_with("raw result", root, 3)
+            safe_final.assert_called_once_with("raw result", root, max_images=3)
             self.assertEqual(images, [])
             self.assertIn("another task", notification)
             self.assertIn(thread.thread_id, notification)
-            command = keyboard["content"]["rows"][0]["buttons"][0]["action"]["data"]
+            command = actions[0][0].command
             self.assertEqual(command, f"/use {thread.thread_id}")
 
     def test_idle_checkpoint_overrides_incomplete_owned_turn(self) -> None:

@@ -16,6 +16,16 @@ SPEC.loader.exec_module(macos_service)
 
 
 class MacOSServiceTests(unittest.TestCase):
+    def test_runtime_source_files_include_channel_adapters(self) -> None:
+        self.assertTrue(
+            {
+                "channel_factory.py",
+                "chat_channel.py",
+                "dingtalk_gateway.py",
+                "qq_channel.py",
+            }.issubset(macos_service.RUNTIME_SOURCE_FILES)
+        )
+
     def test_plist_runs_bridge_from_runtime_directory(self) -> None:
         runtime = Path("/tmp/CodexQQBridge")
         python_bin = Path("/usr/bin/python3")

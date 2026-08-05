@@ -159,6 +159,7 @@ def resolve_command(command: Tuple[str, ...]) -> Tuple[str, ...]:
 @dataclass(frozen=True)
 class Config:
     base_dir: Path
+    enabled_channels: Tuple[str, ...]
     qq_app_id: str
     qq_app_secret: str
     qq_bind_code: str
@@ -171,6 +172,17 @@ class Config:
     qq_attachment_max_bytes: int
     qq_attachment_max_images: int
     qq_notify_on_ready: bool
+    dingtalk_client_id: str
+    dingtalk_client_secret: str
+    dingtalk_robot_code: str
+    dingtalk_bind_code: str
+    dingtalk_allowed_user_id: str
+    dingtalk_api_base: str
+    dingtalk_reply_chars: int
+    dingtalk_reply_chunks: int
+    dingtalk_attachment_max_bytes: int
+    dingtalk_attachment_max_images: int
+    dingtalk_notify_on_ready: bool
     codex_desktop_refresh: bool
     codex_desktop_cdp_url: str
     codex_desktop_refresh_delay_ms: int
@@ -185,10 +197,24 @@ class Config:
     queue_wait_timeout: int
 
     @classmethod
-    def from_env(cls, base_dir: Path, require_qq: bool = True) -> "Config":
+    def from_env(
+        cls,
+        base_dir: Path,
+        require_channel_credentials: bool = True,
+    ) -> "Config":
         load_env(base_dir / ".env")
+        raw_channels = os.getenv("BRIDGE_CHANNELS", "qq")
+        enabled_channels = tuple(
+            dict.fromkeys(
+                value.strip().lower()
+                for value in raw_channels.split(",")
+                if value.strip()
+            )
+        )
         app_id = os.getenv("QQ_APP_ID", "").strip()
         app_secret = os.getenv("QQ_APP_SECRET", "").strip()
+        dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID", "").strip()
+        dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "").strip()
         thread_id = os.getenv("CODEX_THREAD_ID", "").strip()
         workdir = Path(os.getenv("CODEX_WORKDIR", str(base_dir))).expanduser()
         sessions_dir = Path(
@@ -216,10 +242,29 @@ class Config:
         ).strip().rstrip("/")
 
         errors: List[str] = []
-        if require_qq and not app_id:
+        unknown_channels = set(enabled_channels) - {"qq", "dingtalk"}
+        if not enabled_channels:
+            errors.append("BRIDGE_CHANNELS 至少需要启用一个渠道")
+        if unknown_channels:
+            errors.append(
+                "BRIDGE_CHANNELS 包含未知渠道: " + ", ".join(sorted(unknown_channels))
+            )
+        if require_channel_credentials and "qq" in enabled_channels and not app_id:
             errors.append("QQ_APP_ID 未配置")
-        if require_qq and not app_secret:
+        if require_channel_credentials and "qq" in enabled_channels and not app_secret:
             errors.append("QQ_APP_SECRET 未配置")
+        if (
+            require_channel_credentials
+            and "dingtalk" in enabled_channels
+            and not dingtalk_client_id
+        ):
+            errors.append("DINGTALK_CLIENT_ID 未配置")
+        if (
+            require_channel_credentials
+            and "dingtalk" in enabled_channels
+            and not dingtalk_client_secret
+        ):
+            errors.append("DINGTALK_CLIENT_SECRET 未配置")
         if not thread_id or not THREAD_ID_RE.fullmatch(thread_id):
             errors.append("CODEX_THREAD_ID 必须是有效的 Codex UUID")
         if not workdir.is_dir():
@@ -245,6 +290,7 @@ class Config:
 
         return cls(
             base_dir=base_dir,
+            enabled_channels=enabled_channels,
             qq_app_id=app_id,
             qq_app_secret=app_secret,
             qq_bind_code=os.getenv("QQ_BIND_CODE", "").strip(),
@@ -263,6 +309,34 @@ class Config:
             ),
             qq_attachment_max_images=env_int("QQ_ATTACHMENT_MAX_IMAGES", 3, 1, 5),
             qq_notify_on_ready=env_bool("QQ_NOTIFY_ON_READY", False),
+            dingtalk_client_id=dingtalk_client_id,
+            dingtalk_client_secret=dingtalk_client_secret,
+            dingtalk_robot_code=os.getenv("DINGTALK_ROBOT_CODE", "").strip(),
+            dingtalk_bind_code=os.getenv("DINGTALK_BIND_CODE", "").strip(),
+            dingtalk_allowed_user_id=os.getenv(
+                "DINGTALK_ALLOWED_USER_ID", ""
+            ).strip(),
+            dingtalk_api_base=os.getenv(
+                "DINGTALK_API_BASE", "https://api.dingtalk.com"
+            ).rstrip("/"),
+            dingtalk_reply_chars=env_int(
+                "DINGTALK_REPLY_MAX_CHARS", 1800, 200, 4000
+            ),
+            dingtalk_reply_chunks=env_int(
+                "DINGTALK_REPLY_MAX_CHUNKS", 8, 1, 20
+            ),
+            dingtalk_attachment_max_bytes=env_int(
+                "DINGTALK_ATTACHMENT_MAX_BYTES",
+                20 * 1024 * 1024,
+                1024,
+                20 * 1024 * 1024,
+            ),
+            dingtalk_attachment_max_images=env_int(
+                "DINGTALK_ATTACHMENT_MAX_IMAGES", 3, 1, 5
+            ),
+            dingtalk_notify_on_ready=env_bool(
+                "DINGTALK_NOTIFY_ON_READY", False
+            ),
             codex_desktop_refresh=env_bool("CODEX_DESKTOP_REFRESH", False),
             codex_desktop_cdp_url=desktop_cdp_url,
             codex_desktop_refresh_delay_ms=env_int(

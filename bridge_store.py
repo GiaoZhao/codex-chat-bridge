@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 ACTIVE_JOB_STATUSES = ("queued", "waiting", "preparing", "dispatching", "running")
@@ -31,6 +31,7 @@ class OutboxItem:
     dedupe_key: str
     payload: Dict[str, Any]
     attempts: int
+    channel: str = "qq"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class OutboxSpec:
     dedupe_key: str
     payload: Dict[str, Any]
     group_key: str = ""
+    channel: str = "qq"
 
 
 class BridgeInstanceLock:
@@ -135,6 +137,7 @@ class BridgeStore:
                     outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     dedupe_key TEXT NOT NULL UNIQUE,
                     group_key TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT 'qq',
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -158,10 +161,20 @@ class BridgeStore:
                 connection.execute(
                     "ALTER TABLE outbox ADD COLUMN group_key TEXT NOT NULL DEFAULT ''"
                 )
+            if "channel" not in columns:
+                connection.execute(
+                    "ALTER TABLE outbox ADD COLUMN channel TEXT NOT NULL DEFAULT 'qq'"
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS outbox_group_order_idx
                     ON outbox(group_key, outbox_id, status)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS outbox_channel_due_idx
+                    ON outbox(channel, status, next_attempt_at, lease_until, outbox_id)
                 """
             )
             now = time.time()
@@ -463,11 +476,18 @@ class BridgeStore:
             cursor = connection.execute(
                 """
                 INSERT INTO outbox(
-                    dedupe_key, group_key, payload_json, status, attempts,
+                    dedupe_key, group_key, channel, payload_json, status, attempts,
                     next_attempt_at, lease_until, created_at, updated_at
-                ) VALUES (?, ?, ?, 'pending', 0, 0, 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, 'pending', 0, 0, 0, ?, ?)
                 """,
-                (item.dedupe_key, item.group_key, encoded, now, now),
+                (
+                    item.dedupe_key,
+                    item.group_key,
+                    item.channel,
+                    encoded,
+                    now,
+                    now,
+                ),
             )
             results.append((int(cursor.lastrowid), True))
         return results
@@ -499,17 +519,35 @@ class BridgeStore:
             )
             return cursor.rowcount
 
-    def claim_due_outbox(self, lease_seconds: float = 60) -> Optional[OutboxItem]:
+    def claim_due_outbox(
+        self,
+        lease_seconds: float = 60,
+        channels: Optional[Iterable[str]] = None,
+    ) -> Optional[OutboxItem]:
         now = time.time()
+        normalized_channels: Optional[Tuple[str, ...]] = None
+        if channels is not None:
+            normalized_channels = tuple(
+                dict.fromkeys(value.strip().lower() for value in channels if value.strip())
+            )
+            if not normalized_channels:
+                return None
+        channel_clause = ""
+        parameters: List[Any] = [now, now]
+        if normalized_channels is not None:
+            placeholders = ",".join("?" for _ in normalized_channels)
+            channel_clause = f"AND candidate.channel IN ({placeholders})"
+            parameters.extend(normalized_channels)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """
+                f"""
                 SELECT candidate.* FROM outbox AS candidate
                 WHERE (
                     (candidate.status = 'pending' AND candidate.next_attempt_at <= ?)
                     OR (candidate.status = 'sending' AND candidate.lease_until <= ?)
                 )
+                {channel_clause}
                 AND (
                     candidate.group_key = ''
                     OR NOT EXISTS (
@@ -522,7 +560,7 @@ class BridgeStore:
                 ORDER BY candidate.outbox_id
                 LIMIT 1
                 """,
-                (now, now),
+                parameters,
             ).fetchone()
             if not row:
                 connection.commit()
@@ -541,6 +579,7 @@ class BridgeStore:
             dedupe_key=str(row["dedupe_key"]),
             payload=self._decode_json(str(row["payload_json"])),
             attempts=int(row["attempts"]),
+            channel=str(row["channel"] or "qq"),
         )
 
     def mark_outbox_sent(self, outbox_id: int) -> None:

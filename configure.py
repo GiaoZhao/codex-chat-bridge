@@ -15,6 +15,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_THREAD_ID = ""
 DEFAULT_WORKDIR = ""
 DEFAULT_QQ_APP_ID = ""
+DEFAULT_CHANNELS = "qq"
 
 
 def ask(label: str, default: str = "", secret: bool = False) -> str:
@@ -58,7 +59,7 @@ end run
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Configure the QQ adapter for Codex Chat Bridge"
+        description="Configure chat adapters for Codex Chat Bridge"
     )
     parser.add_argument("--gui", action="store_true", help="use secure macOS dialogs")
     args = parser.parse_args()
@@ -76,12 +77,42 @@ def main() -> int:
             return 1
 
     ask_value = gui_ask if args.gui else ask
-    app_id = require_single_line(
-        "QQ AppID", ask_value("QQ Bot AppID", DEFAULT_QQ_APP_ID)
+    raw_channels = require_single_line(
+        "Bridge channels",
+        ask_value("启用渠道，逗号分隔（qq,dingtalk）", DEFAULT_CHANNELS),
     )
-    app_secret = require_single_line(
-        "QQ AppSecret", ask_value("QQ Bot AppSecret", secret=True)
+    channels = tuple(
+        dict.fromkeys(
+            value.strip().lower()
+            for value in raw_channels.split(",")
+            if value.strip()
+        )
     )
+    unknown = set(channels) - {"qq", "dingtalk"}
+    if not channels or unknown:
+        detail = ", ".join(sorted(unknown)) if unknown else "空配置"
+        raise ValueError(f"启用渠道无效: {detail}")
+
+    app_id = ""
+    app_secret = ""
+    if "qq" in channels:
+        app_id = require_single_line(
+            "QQ AppID", ask_value("QQ Bot AppID", DEFAULT_QQ_APP_ID)
+        )
+        app_secret = require_single_line(
+            "QQ AppSecret", ask_value("QQ Bot AppSecret", secret=True)
+        )
+    dingtalk_client_id = ""
+    dingtalk_client_secret = ""
+    if "dingtalk" in channels:
+        dingtalk_client_id = require_single_line(
+            "DingTalk Client ID",
+            ask_value("钉钉应用 Client ID（AppKey）"),
+        )
+        dingtalk_client_secret = require_single_line(
+            "DingTalk Client Secret",
+            ask_value("钉钉应用 Client Secret（AppSecret）", secret=True),
+        )
     thread_id = require_single_line(
         "Codex Thread ID", ask_value("Codex Thread ID", DEFAULT_THREAD_ID)
     )
@@ -89,15 +120,27 @@ def main() -> int:
         "Codex Workdir", ask_value("Codex 工作目录", DEFAULT_WORKDIR)
     )
     command = shutil.which("codex") or "codex"
-    bind_code = "".join(secrets.choice("0123456789") for _ in range(8))
+    qq_bind_code = "".join(secrets.choice("0123456789") for _ in range(8))
+    dingtalk_bind_code = "".join(
+        secrets.choice("0123456789") for _ in range(8)
+    )
     desktop_refresh = "0"
 
     values = {
+        "BRIDGE_CHANNELS": ",".join(channels),
         "QQ_APP_ID": app_id,
         "QQ_APP_SECRET": app_secret,
-        "QQ_BIND_CODE": bind_code,
+        "QQ_BIND_CODE": qq_bind_code if "qq" in channels else "",
         "QQ_ALLOWED_OPENID": "",
         "QQ_NOTIFY_ON_READY": "0",
+        "DINGTALK_CLIENT_ID": dingtalk_client_id,
+        "DINGTALK_CLIENT_SECRET": dingtalk_client_secret,
+        "DINGTALK_ROBOT_CODE": dingtalk_client_id,
+        "DINGTALK_BIND_CODE": (
+            dingtalk_bind_code if "dingtalk" in channels else ""
+        ),
+        "DINGTALK_ALLOWED_USER_ID": "",
+        "DINGTALK_NOTIFY_ON_READY": "0",
         "CODEX_THREAD_ID": thread_id,
         "CODEX_WORKDIR": workdir,
         "CODEX_COMMAND": command,
@@ -108,6 +151,10 @@ def main() -> int:
         "QQ_REPLY_MAX_CHUNKS": "8",
         "QQ_ATTACHMENT_MAX_BYTES": "20971520",
         "QQ_ATTACHMENT_MAX_IMAGES": "3",
+        "DINGTALK_REPLY_MAX_CHARS": "1800",
+        "DINGTALK_REPLY_MAX_CHUNKS": "8",
+        "DINGTALK_ATTACHMENT_MAX_BYTES": "20971520",
+        "DINGTALK_ATTACHMENT_MAX_IMAGES": "3",
         "CODEX_TURN_TIMEOUT": "7200",
         "CODEX_QUEUE_WAIT_TIMEOUT": "21600",
     }
@@ -115,8 +162,12 @@ def main() -> int:
     env_path.write_text(content, encoding="utf-8")
     os.chmod(env_path, 0o600)
     print(f"配置已写入：{env_path}")
-    print(f"首次绑定码：{bind_code}")
-    print("启动后，在 QQ 私聊机器人发送：/bind " + bind_code)
+    if "qq" in channels:
+        print(f"QQ 首次绑定码：{qq_bind_code}")
+        print("启动后，在 QQ 私聊机器人发送：/bind " + qq_bind_code)
+    if "dingtalk" in channels:
+        print(f"钉钉首次绑定码：{dingtalk_bind_code}")
+        print("启动后，在钉钉私聊机器人发送：/bind " + dingtalk_bind_code)
     return 0
 
 

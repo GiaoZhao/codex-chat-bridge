@@ -26,7 +26,11 @@ RUNTIME_SOURCE_FILES = (
     "bridge.py",
     "bridge_core.py",
     "bridge_store.py",
+    "channel_factory.py",
+    "chat_channel.py",
     "codex_app_server.py",
+    "dingtalk_gateway.py",
+    "qq_channel.py",
     "qq_gateway.py",
 )
 

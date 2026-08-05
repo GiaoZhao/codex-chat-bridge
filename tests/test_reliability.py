@@ -21,12 +21,160 @@ from bridge_core import (
     session_record_event_id,
 )
 from bridge_store import BridgeInstanceLock, BridgeStore, OutboxSpec
+from chat_channel import (
+    ChannelLimits,
+    ChannelRegistry,
+    InboundMessage,
+    Recipient,
+    action_rows,
+)
 
 
 THREAD_ID = "00000000-0000-4000-8000-000000000001"
 
 
+class FakeQQChannel:
+    name = "qq"
+    bind_code = "12345678"
+    configured_recipient = "user"
+    notify_on_ready = False
+
+    def __init__(self) -> None:
+        self.limits = ChannelLimits(1500, 8, 20 * 1024 * 1024, 3, 4)
+        self.sent_text: list[tuple] = []
+        self.sent_images: list[tuple] = []
+        self.ready = True
+
+    def run_forever(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def is_ready(self) -> bool:
+        return self.ready
+
+    def send_text(self, recipient_id: str, text: str, **kwargs: object) -> None:
+        self.sent_text.append((recipient_id, text, kwargs))
+
+    def send_typing(self, recipient_id: str, reply_to: str) -> None:
+        return
+
+    def send_image(self, recipient_id: str, path: Path, sequence: int = 1) -> None:
+        self.sent_images.append((recipient_id, path, sequence))
+
+    def download_images(self, attachments: object, target_dir: Path) -> list[Path]:
+        return []
+
+    def redact_error(self, error: object, recipient_id: str) -> str:
+        return str(error).replace(recipient_id, "[recipient]")
+
+
+class FakeDingTalkChannel(FakeQQChannel):
+    name = "dingtalk"
+    bind_code = "87654321"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.limits = ChannelLimits(
+            1800,
+            8,
+            20 * 1024 * 1024,
+            3,
+            supports_outbound_images=False,
+        )
+
+
 class BridgeStoreTests(unittest.TestCase):
+    def test_existing_qq_outbox_is_migrated_to_qq_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            database = Path(raw_dir) / "bridge.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE outbox (
+                        outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        group_key TEXT NOT NULL DEFAULT '',
+                        payload_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        next_attempt_at REAL NOT NULL DEFAULT 0,
+                        lease_until REAL NOT NULL DEFAULT 0,
+                        last_error TEXT NOT NULL DEFAULT '',
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        sent_at REAL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO outbox(
+                        dedupe_key, payload_json, created_at, updated_at
+                    ) VALUES ('legacy', '{"kind":"text"}', 1, 1)
+                    """
+                )
+
+            store = BridgeStore(database)
+            item = store.claim_due_outbox(channels=("qq",))
+
+            self.assertEqual(item.dedupe_key, "legacy")
+            self.assertEqual(item.channel, "qq")
+
+    def test_outbox_claim_only_uses_ready_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            store = BridgeStore(Path(raw_dir) / "bridge.sqlite3")
+            store.enqueue_outbox_batch(
+                [
+                    OutboxSpec("qq:first", {"kind": "text"}, channel="qq"),
+                    OutboxSpec(
+                        "dingtalk:first",
+                        {"kind": "text"},
+                        channel="dingtalk",
+                    ),
+                ]
+            )
+
+            dingtalk = store.claim_due_outbox(channels=("dingtalk",))
+
+            self.assertEqual(dingtalk.channel, "dingtalk")
+            self.assertEqual(dingtalk.dedupe_key, "dingtalk:first")
+            store.mark_outbox_sent(dingtalk.outbox_id)
+            self.assertIsNone(store.claim_due_outbox(channels=("dingtalk",)))
+            self.assertEqual(
+                store.claim_due_outbox(channels=("qq",)).dedupe_key,
+                "qq:first",
+            )
+
+    def test_same_event_can_enqueue_one_notification_per_channel(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        service.channels = ChannelRegistry(
+            [FakeQQChannel(), FakeDingTalkChannel()]
+        )
+        qq_items = service._text_outbox_specs(
+            Recipient("qq", "user"),
+            "same result",
+            dedupe_key="session-final:event-1",
+        )
+        dingtalk_items = service._text_outbox_specs(
+            Recipient("dingtalk", "user"),
+            "same result",
+            dedupe_key="session-final:event-1",
+        )
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            store = BridgeStore(Path(raw_dir) / "bridge.sqlite3")
+            created = store.enqueue_outbox_batch([*qq_items, *dingtalk_items])
+
+        self.assertEqual(len(qq_items), 1)
+        self.assertEqual(len(dingtalk_items), 1)
+        self.assertNotEqual(qq_items[0].dedupe_key, dingtalk_items[0].dedupe_key)
+        self.assertEqual(
+            [was_created for _item_id, was_created in created],
+            [True, True],
+        )
+
     def test_job_acceptance_is_deduplicated_and_capacity_is_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             store = BridgeStore(Path(raw_dir) / "bridge.sqlite3")
@@ -340,7 +488,9 @@ class TerminalNotificationTests(unittest.TestCase):
             qq_attachment_max_bytes=20 * 1024 * 1024,
             qq_attachment_max_images=3,
         )
-        service.bound_openid = ""
+        service.bound_recipients = {"qq": "user"}
+        service.channel = FakeQQChannel()
+        service.channels = ChannelRegistry([service.channel])
         service.store = BridgeStore(root / "data" / "bridge.sqlite3")
         service.outbox_wakeup = threading.Event()
         service._outbox_image_lock = threading.RLock()
@@ -444,7 +594,7 @@ class TerminalNotificationTests(unittest.TestCase):
                 )
                 self.assertIn(winning_question, notice.payload["text"])
                 self.assertNotIn(losing_question, notice.payload["text"])
-                self.assertEqual(notice.dedupe_key, "session-final:event-1:chunk:1")
+                self.assertEqual(notice.dedupe_key, "qq:session-final:event-1:chunk:1")
 
     def test_success_notification_serialization_failure_rolls_back_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -513,10 +663,8 @@ class TerminalNotificationTests(unittest.TestCase):
             spooled = Path(image_notice.payload["path"])
             self.assertNotEqual(spooled, image.resolve())
             self.assertTrue(spooled.is_file())
-            service.api = Mock()
-            service.api.upload_c2c_image.return_value = "file-info"
             service._deliver_outbox(image_notice)
-            service.api.upload_c2c_image.assert_called_once_with("user", spooled)
+            self.assertEqual(service.channel.sent_images, [("user", spooled, 1)])
             service.store.mark_outbox_sent(image_notice.outbox_id)
             service._cleanup_unreferenced_outbox_images()
             self.assertFalse(spooled.exists())
@@ -566,7 +714,7 @@ class TerminalNotificationTests(unittest.TestCase):
             self.assertEqual(service.store.pending_outbox_count(), 1)
             self.assertEqual(
                 service.store.claim_due_outbox().dedupe_key,
-                "session-interrupted:event-1:chunk:1",
+                "qq:session-interrupted:event-1:chunk:1",
             )
 
 
@@ -575,12 +723,16 @@ class BridgeAcceptanceTests(unittest.TestCase):
         service = BridgeService.__new__(BridgeService)
         service.config = SimpleNamespace(
             base_dir=root,
+            qq_allowed_openid="user",
             qq_reply_chunks=8,
             qq_reply_chars=1500,
             qq_attachment_max_bytes=20 * 1024 * 1024,
             qq_attachment_max_images=3,
         )
         service.store = BridgeStore(root / "data" / "bridge.sqlite3")
+        service.bound_recipients = {"qq": "user"}
+        service.channel = FakeQQChannel()
+        service.channels = ChannelRegistry([service.channel])
         service.jobs = queue.Queue()
         service.outbox_wakeup = threading.Event()
         service._outbox_image_lock = threading.RLock()
@@ -591,12 +743,7 @@ class BridgeAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
             service = self._service(root)
-            event = {
-                "openid": "user",
-                "message_id": "message-1",
-                "content": "continue",
-                "attachments": [],
-            }
+            event = InboundMessage("qq", "user", "message-1", "continue")
 
             accepted = service._accept_remote_job(
                 event,
@@ -615,22 +762,55 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertNotIn("正在继续", outbox.payload["text"])
             self.assertNotIn("已启动", outbox.payload["text"])
 
-    def test_keyboard_is_attached_only_to_the_last_markdown_chunk(self) -> None:
+    def test_each_channel_keeps_an_independent_binding(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        service.channels = ChannelRegistry(
+            [FakeQQChannel(), FakeDingTalkChannel()]
+        )
+        service.bound_recipients = {}
+        service.state = Mock()
+        service._safe_send = Mock(return_value=True)
+
+        service._bind(
+            InboundMessage("qq", "qq-user", "qq-message", "/bind 12345678")
+        )
+        service._bind(
+            InboundMessage(
+                "dingtalk",
+                "ding-user",
+                "ding-message",
+                "/bind 87654321",
+            )
+        )
+
+        self.assertEqual(
+            service.bound_recipients,
+            {"qq": "qq-user", "dingtalk": "ding-user"},
+        )
+        self.assertEqual(
+            service.state.update.call_args.kwargs["bindings"],
+            {
+                "qq": {"recipient_id": "qq-user"},
+                "dingtalk": {"recipient_id": "ding-user"},
+            },
+        )
+
+    def test_actions_are_attached_only_to_the_last_markdown_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             service = self._service(Path(raw_dir))
-            service.config.qq_reply_chars = 80
-            keyboard = {"content": {"rows": []}}
+            service.channel.limits = ChannelLimits(80, 8, 20 * 1024 * 1024, 3, 4)
+            actions = action_rows([[("当前任务", "/current", 0)]])
 
             items = service._text_outbox_specs(
                 "user",
                 "第一段 " + "x" * 220,
-                keyboard=keyboard,
+                actions=actions,
                 dedupe_key="long-message",
             )
 
             self.assertGreater(len(items), 1)
-            self.assertTrue(all(item.payload["keyboard"] is None for item in items[:-1]))
-            self.assertEqual(items[-1].payload["keyboard"], keyboard)
+            self.assertTrue(all(item.payload["actions"] == [] for item in items[:-1]))
+            self.assertEqual(items[-1].payload["actions"][0][0]["command"], "/current")
 
     def test_started_notification_requires_running_transition(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -705,11 +885,11 @@ class BridgeAcceptanceTests(unittest.TestCase):
         openid = "user/id+secret"
         error = "POST https://api.example/v2/users/user%2Fid%2Bsecret/messages failed"
 
-        detail = BridgeService._redact_openid(error, openid)
+        detail = BridgeService._redact_recipient(error, openid)
 
         self.assertNotIn(openid, detail)
         self.assertNotIn("user%2Fid%2Bsecret", detail)
-        self.assertIn("[openid]", detail)
+        self.assertIn("[recipient]", detail)
 
     def test_shutdown_before_dispatch_requeues_the_job(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -948,14 +1128,13 @@ class BridgeAcceptanceTests(unittest.TestCase):
         service.stop_event = Mock()
         service.stop_event.is_set.side_effect = lambda: stopped["value"]
         service.stop_event.wait.return_value = False
-        service.gateway_ready = Mock()
-        service.gateway_ready.is_set.return_value = True
+        service.channels = ChannelRegistry([FakeQQChannel()])
         service.outbox_wakeup = Mock()
         service.store = Mock()
 
         calls = {"count": 0}
 
-        def claim() -> None:
+        def claim(*_args: object, **_kwargs: object) -> None:
             calls["count"] += 1
             if calls["count"] == 1:
                 raise sqlite3.OperationalError("database busy")
