@@ -538,6 +538,20 @@ class ThreadIndexTests(unittest.TestCase):
                 40,
                 40000,
             ),
+            (
+                "00000000-0000-4000-8000-000000000005",
+                str(root / "rollout-delegated.jsonl"),
+                str(root),
+                "delegated task",
+                "delegated",
+                "visible",
+                1,
+                0,
+                "vscode",
+                "subagent",
+                5,
+                5000,
+            ),
         ]
         connection.executemany(
             "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -547,17 +561,20 @@ class ThreadIndexTests(unittest.TestCase):
         connection.close()
         return ThreadIndex(database)
 
-    def test_lists_only_visible_root_threads_and_resolves_number(self) -> None:
+    def test_lists_user_visible_threads_and_excludes_internal_subagents(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
             index = self._create_index(root)
             threads, total = index.list_page(page=1, page_size=8)
-            self.assertEqual(total, 2)
-            self.assertEqual([item.title for item in threads], ["newer task", "older task"])
+            self.assertEqual(total, 3)
+            self.assertEqual(
+                [item.title for item in threads],
+                ["newer task", "older task", "delegated task"],
+            )
             self.assertEqual(index.resolve("2").title, "older task")
             self.assertIsNone(index.resolve("999"))
             monitorable = index.list_monitorable()
-            self.assertEqual(len(monitorable), 2)
+            self.assertEqual(len(monitorable), 3)
             self.assertTrue(all(item.rollout_path is not None for item in monitorable))
 
     def test_active_thread_persists_switch(self) -> None:

@@ -3,8 +3,9 @@
 将本机 Codex Desktop 原生任务桥接到聊天平台。当前版本提供 QQ 官方机器人和
 钉钉企业内部应用机器人的私聊适配器：
 
-- 任一可见的 Codex Desktop 根任务产生最终结果后，桥接器都把任务标题和结果主动发送
-  到所有已绑定渠道；guardian、subagent 和已归档任务不会推送。
+- 任一用户可见的 Codex Desktop 任务产生最终结果后，桥接器都把任务标题和结果主动发送
+  到所有已绑定渠道；包括由 Codex 拉起的可见委派任务，guardian、内部 subagent 和已归档
+  任务不会推送。
 - 在 QQ 或钉钉私聊机器人发送普通文字后，macOS 可通过 standalone Codex shared daemon 直接在
   Desktop 对应任务中启动回合；shared daemon 不可用时可回退 `codex exec resume`。
 - 可从任一已启用渠道列出桌面端任务、切换任务，或在当前项目目录中新建任务。
@@ -81,16 +82,16 @@ QQ 发起任务时会依次区分“已接收并保存”“等待已有任务�
 回执语义、重启恢复边界、错误通知能力和取日志步骤见
 [Reliability and Troubleshooting](docs/reliability.md)。
 
-全部任务通知使用 Codex 只读任务索引取得可见根任务，并为每个 rollout 文件保存独立
+全部任务通知使用 Codex 只读任务索引取得用户可见任务，并为每个 rollout 文件保存独立
 字节游标。每次启动都在当时最后一条完整 JSONL 记录之后建立新基线，不补发 Bridge 停止
 期间积累的历史回复；若启动瞬间最后一条记录仍在写入，则写完后仍会正常处理。通知卡片
 会携带本轮问题节选；长 Markdown 按段落、完整链接、表格行和代码围栏安全分片，操作按钮
 只出现在最后一片。无法与表头共同装入单片的极宽表格会明确降级为分段文本。通知卡片中
 的“切换到此任务”按钮只改变 QQ 后续消息所操作的任务，收到通知本身不会自动切换。
 
-任务列表只读查询 `~/.codex/state_5.sqlite`，排除已归档任务及 guardian/subagent 等内部
-任务，不会修改 Codex 数据库。当前选中的任务和工作目录保存在 `data/state.json`，桥接
-重启后继续使用。
+任务列表只读查询 `~/.codex/state_5.sqlite`，保留由 Codex 拉起的用户可见委派任务，排除
+已归档任务及 guardian/内部 subagent，不会修改 Codex 数据库。当前选中的任务和工作目录
+保存在 `data/state.json`，桥接重启后继续使用。
 
 ## 前置条件
 
@@ -171,7 +172,7 @@ Codex 命令、任务索引和会话文件均可读取后再启动。
 `configure.py` 首先要求输入启用渠道：`qq`、`dingtalk` 或
 `qq,dingtalk`，然后只询问已选渠道的凭证。它还会要求输入一个初始 Codex
 Thread UUID 和该任务的工作目录。若不知道 Thread UUID，可在终端列出最近的
-本地根任务。
+本地用户可见任务。
 
 macOS：
 

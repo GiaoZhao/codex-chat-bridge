@@ -421,8 +421,7 @@ class ThreadIndex:
     def _visible_where() -> str:
         return (
             "archived = 0 AND preview <> '' "
-            "AND source NOT LIKE '%subagent%' "
-            "AND COALESCE(thread_source, '') <> 'subagent'"
+            "AND source NOT LIKE '%subagent%'"
         )
 
     def _columns(self, connection: sqlite3.Connection) -> set[str]:
