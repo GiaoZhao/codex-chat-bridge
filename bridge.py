@@ -66,6 +66,7 @@ from chat_channel import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
+THREAD_PAGE_SIZE = 6
 
 
 @dataclass(frozen=True)
@@ -455,8 +456,17 @@ class BridgeService:
     def _main_actions(cls) -> ActionRows:
         return cls._actions(
             [
-                [("任务列表", "/threads", 1), ("当前任务", "/current", 0)],
-                [("执行状态", "/status", 0), ("最近结果", "/recent", 0)],
+                [("任务列表", "/threads", 1), ("搜索任务", "/search", 0)],
+                [
+                    ("当前任务", "/current", 0),
+                    ("执行状态", "/status", 0),
+                    ("最近结果", "/recent", 0),
+                ],
+                [
+                    ("新建任务", "/new", 1),
+                    ("取消任务", "/cancel", 2),
+                    ("操作帮助", "/help", 0),
+                ],
             ]
         )
 
@@ -920,6 +930,8 @@ class BridgeService:
             [
                 "直接发送文字：继续当前 Codex 任务",
                 "/threads [页码]：列出可切换任务",
+                "/search <关键词>：检索任务",
+                "/search <页码> <关键词>：查看后续检索结果",
                 "/use <编号或UUID>：切换并返回最新一轮原文",
                 "/current：查看当前任务",
                 "/new <第一条消息>：在当前项目中新建任务",
@@ -949,7 +961,7 @@ class BridgeService:
         )
 
     def _threads_text(self, page: int) -> str:
-        page_size = 8
+        page_size = THREAD_PAGE_SIZE
         threads, total = self.thread_index.list_page(page, page_size)
         total_pages = max(1, (total + page_size - 1) // page_size)
         if page > total_pages:
@@ -963,14 +975,50 @@ class BridgeService:
             lines.append(
                 f"{marker}{start + offset}. [{info.project_name}] {self._short_title(info.title)}"
             )
-        lines.extend(["", "发送 /use 编号 切换；* 表示当前任务。"])
-        if page < total_pages:
-            lines.append(f"下一页：/threads {page + 1}")
+        lines.extend(["", "点击任务按钮，或发送 /use 编号切换；* 表示当前任务。"])
         return "\n".join(lines)
 
-    def _threads_actions(self, page: int) -> ActionRows:
-        page_size = 8
-        threads, total = self.thread_index.list_page(page, page_size)
+    def _search_text(self, query: str, page: int) -> str:
+        page_size = THREAD_PAGE_SIZE
+        threads, total = self.thread_index.search_page(query, page, page_size)
+        if total == 0:
+            return f"没有找到包含“{self._short_title(query, 40)}”的任务。"
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            return f"页码超出范围。当前检索结果共 {total_pages} 页。"
+        active_id = self.active_thread.snapshot().thread_id
+        lines = [
+            f"检索“{self._short_title(query, 40)}”（第 {page}/{total_pages} 页，共 {total} 个）"
+        ]
+        start = (page - 1) * page_size
+        for offset, info in enumerate(threads, 1):
+            self.thread_choices[start + offset] = info.thread_id
+            marker = "*" if info.thread_id == active_id else " "
+            lines.append(
+                f"{marker}{start + offset}. [{info.project_name}] {self._short_title(info.title)}"
+            )
+        lines.extend(["", "点击任务按钮，或发送 /use 编号切换；* 表示当前任务。"])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_search_argument(argument: str) -> tuple[int, str]:
+        value = " ".join(argument.split())
+        if not value:
+            raise ValueError
+        parts = value.split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            page = int(parts[0])
+            if page < 1:
+                raise ValueError
+            return page, parts[1]
+        return 1, value
+
+    def _thread_actions(self, page: int, query: str = "") -> ActionRows:
+        page_size = THREAD_PAGE_SIZE
+        if query:
+            threads, total = self.thread_index.search_page(query, page, page_size)
+        else:
+            threads, total = self.thread_index.list_page(page, page_size)
         start = (page - 1) * page_size
         rows: List[List[tuple[str, str, int]]] = []
         active_id = self.active_thread.snapshot().thread_id
@@ -982,18 +1030,33 @@ class BridgeService:
                 number = start + offset
                 label = f"{number}. {self._short_title(info.title, 12)}"
                 row.append(
-                    (label, f"/use {number}", 1 if info.thread_id == active_id else 0)
+                    (
+                        label,
+                        f"/use {info.thread_id}",
+                        1 if info.thread_id == active_id else 0,
+                    )
                 )
             rows.append(row)
         total_pages = max(1, (total + page_size - 1) // page_size)
         navigation = []
+        command = "/search {page} {query}" if query else "/threads {page}"
         if page > 1:
-            navigation.append(("上一页", f"/threads {page - 1}", 0))
+            navigation.append(
+                ("上一页", command.format(page=page - 1, query=query), 0)
+            )
         if page < total_pages:
-            navigation.append(("下一页", f"/threads {page + 1}", 0))
+            navigation.append(
+                ("下一页", command.format(page=page + 1, query=query), 0)
+            )
         if navigation:
             rows.append(navigation)
-        rows.append([("当前任务", "/current", 0), ("执行状态", "/status", 0)])
+        rows.append(
+            [
+                ("搜索任务", "/search", 0),
+                ("当前任务", "/current", 0),
+                ("操作菜单", "/help", 0),
+            ]
+        )
         return self._actions(rows)
 
     def _thread_is_busy(self, thread_id: str) -> bool:
@@ -1231,7 +1294,34 @@ class BridgeService:
                 text = "暂时无法读取本机 Codex 任务列表。"
             actions: ActionRows = ()
             if not text.startswith("用法") and not text.startswith("暂时"):
-                actions = self._threads_actions(page)
+                actions = self._thread_actions(page)
+            self._safe_send(
+                recipient,
+                text,
+                event.message_id,
+                actions=actions,
+            )
+            return
+        if command == "/search":
+            page = 1
+            query = ""
+            try:
+                page, query = self._parse_search_argument(argument)
+                text = self._search_text(query, page)
+            except ValueError:
+                text = (
+                    "用法：/search 关键词\n"
+                    "后续页：/search 页码 关键词\n"
+                    "示例：/search 支付退款"
+                )
+            except Exception as exc:
+                log_event("thread-index", str(exc), level="ERROR")
+                text = "暂时无法检索本机 Codex 任务。"
+            actions: ActionRows = ()
+            if query and not text.startswith("暂时"):
+                actions = self._thread_actions(page, query)
+            if not actions:
+                actions = self._main_actions()
             self._safe_send(
                 recipient,
                 text,
@@ -1306,8 +1396,12 @@ class BridgeService:
             if not argument:
                 self._safe_send(
                     recipient,
-                    "用法：/new 新任务的第一条消息",
+                    (
+                        "请发送：/new 新任务的第一条消息\n"
+                        "示例：/new 排查支付回调失败原因"
+                    ),
                     event.message_id,
+                    actions=self._main_actions(),
                 )
                 return
             active = self.active_thread.snapshot()
