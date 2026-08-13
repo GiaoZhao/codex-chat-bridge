@@ -577,6 +577,43 @@ class ThreadIndexTests(unittest.TestCase):
             self.assertEqual(len(monitorable), 3)
             self.assertTrue(all(item.rollout_path is not None for item in monitorable))
 
+    def test_searches_visible_threads_across_fields_and_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            index = self._create_index(root)
+
+            threads, total = index.search_page("NEWER visible")
+
+            self.assertEqual(total, 1)
+            self.assertEqual([item.title for item in threads], ["newer task"])
+            self.assertEqual(
+                index.search_page("0002")[0][0].thread_id,
+                "00000000-0000-4000-8000-000000000002",
+            )
+            self.assertEqual(index.search_page("subagent"), ([], 0))
+            self.assertEqual(index.search_page("archived"), ([], 0))
+
+    def test_search_treats_sql_wildcards_as_literal_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            index = self._create_index(Path(raw_dir))
+
+            self.assertEqual(index.search_page("%"), ([], 0))
+            self.assertEqual(index.search_page("_"), ([], 0))
+
+    def test_search_results_are_paginated_by_recency(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            index = self._create_index(Path(raw_dir))
+
+            first_page, total = index.search_page("visible", page=1, page_size=2)
+            second_page, _total = index.search_page("visible", page=2, page_size=2)
+
+            self.assertEqual(total, 3)
+            self.assertEqual(
+                [item.title for item in first_page],
+                ["newer task", "older task"],
+            )
+            self.assertEqual([item.title for item in second_page], ["delegated task"])
+
     def test_active_thread_persists_switch(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -770,6 +807,63 @@ class BridgeServiceTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def test_task_actions_fit_qq_keyboard_and_use_stable_thread_ids(self) -> None:
+        root = Path("/project")
+        threads = [
+            ThreadInfo(
+                f"00000000-0000-4000-8000-{number:012d}",
+                f"task {number}",
+                root,
+            )
+            for number in range(7, 13)
+        ]
+        service = BridgeService.__new__(BridgeService)
+        service.thread_index = Mock()
+        service.thread_index.list_page.return_value = (threads, 18)
+        service.active_thread = Mock()
+        service.active_thread.snapshot.return_value = threads[0]
+
+        actions = service._thread_actions(page=2)
+
+        self.assertEqual(len(actions), 5)
+        task_actions = [action for row in actions[:3] for action in row]
+        self.assertEqual(len(task_actions), 6)
+        self.assertEqual(
+            [action.command for action in task_actions],
+            [f"/use {thread.thread_id}" for thread in threads],
+        )
+        self.assertEqual(
+            [action.command for action in actions[-1]],
+            ["/search", "/current", "/help"],
+        )
+
+    def test_main_actions_expose_task_creation_and_help(self) -> None:
+        actions = BridgeService._main_actions()
+
+        self.assertLessEqual(len(actions), 5)
+        self.assertTrue(all(len(row) <= 3 for row in actions))
+        commands = [action.command for row in actions for action in row]
+        self.assertIn("/new", commands)
+        self.assertIn("/cancel", commands)
+        self.assertIn("/help", commands)
+        cancel = next(action for row in actions for action in row if action.command == "/cancel")
+        self.assertEqual(cancel.style, 2)
+
+    def test_search_argument_supports_keyword_and_result_page(self) -> None:
+        self.assertEqual(
+            BridgeService._parse_search_argument("支付 退款"),
+            (1, "支付 退款"),
+        )
+        self.assertEqual(
+            BridgeService._parse_search_argument(" 2   支付 退款 "),
+            (2, "支付 退款"),
+        )
+        self.assertEqual(BridgeService._parse_search_argument("2026"), (1, "2026"))
+        with self.assertRaises(ValueError):
+            BridgeService._parse_search_argument("")
+        with self.assertRaises(ValueError):
+            BridgeService._parse_search_argument("0 任务")
 
     def test_switches_to_idle_target_while_current_thread_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:

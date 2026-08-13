@@ -475,6 +475,63 @@ class ThreadIndex:
             ).fetchall()
         return [self._from_row(row) for row in rows], total
 
+    def search_page(
+        self,
+        query: str,
+        page: int = 1,
+        page_size: int = 6,
+    ) -> Tuple[List[ThreadInfo], int]:
+        terms = query.split()
+        if not terms:
+            return [], 0
+        page = max(1, page)
+        page_size = max(1, min(20, page_size))
+        with self._connect() as connection:
+            columns = self._columns(connection)
+            title_expression, order_expression = self._expressions(connection)
+            search_columns = [
+                column
+                for column in ("id", "cwd", "name", "title", "first_user_message", "preview")
+                if column in columns
+            ]
+            term_clauses = []
+            parameters: List[str] = []
+            for term in terms:
+                escaped = (
+                    term.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped}%"
+                term_clauses.append(
+                    "("
+                    + " OR ".join(
+                        f"COALESCE({column}, '') LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                        for column in search_columns
+                    )
+                    + ")"
+                )
+                parameters.extend(pattern for _column in search_columns)
+            where = f"{self._visible_where()} AND " + " AND ".join(term_clauses)
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM threads WHERE {where}",
+                    parameters,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT id, cwd, rollout_path, {title_expression} AS display_title,
+                       {order_expression} AS sort_time
+                FROM threads
+                WHERE {where}
+                ORDER BY sort_time DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return [self._from_row(row) for row in rows], total
+
     def list_monitorable(self) -> List[ThreadInfo]:
         with self._connect() as connection:
             title_expression, order_expression = self._expressions(connection)
