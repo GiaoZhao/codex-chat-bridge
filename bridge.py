@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import queue
+import re
 import signal
 import shutil
 import sqlite3
@@ -19,9 +20,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from codex_app_server import AppServerCodexRunner, AppServerProtocolError
+from codex_app_server import (
+    AppServerCodexRunner,
+    AppServerProtocolError,
+)
 from bridge_core import (
     ActiveThread,
+    CodexQueueDispatchUncertainError,
     CodexDesktopRefresher,
     CodexRunner,
     Config,
@@ -30,16 +35,21 @@ from bridge_core import (
     ThreadIndex,
     ThreadInfo,
     configure_log_file,
+    codex_writer_lock_held,
     find_session_file,
     final_message_from_record,
     latest_complete_turn,
     latest_final_message,
     log_event,
+    queue_codex_message,
     qq_safe_final,
+    record_turn_id,
     session_record_event_id,
     session_busy,
     split_message,
     summarize_codex_error,
+    user_message_from_record,
+    verify_codex_queue_support,
 )
 from bridge_store import (
     BridgeInstanceLock,
@@ -67,6 +77,9 @@ from chat_channel import (
 
 BASE_DIR = Path(__file__).resolve().parent
 THREAD_PAGE_SIZE = 6
+CODEX_VERSION_RE = re.compile(
+    r"(?<![0-9A-Za-z])(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)(?![0-9A-Za-z])"
+)
 
 
 @dataclass(frozen=True)
@@ -83,10 +96,40 @@ class JobDispatchUncertainError(RuntimeError):
     pass
 
 
+def _codex_version(value: object) -> Optional[str]:
+    match = CODEX_VERSION_RE.search(str(value or ""))
+    return match.group(1) if match else None
+
+
+def _configured_codex_version(config: Any) -> Optional[str]:
+    raw_command = getattr(config, "codex_command", ())
+    if isinstance(raw_command, str):
+        command = [raw_command]
+    elif isinstance(raw_command, (list, tuple)):
+        command = [str(part) for part in raw_command]
+    else:
+        command = []
+    if not command or not command[0]:
+        return None
+    try:
+        completed = subprocess.run(
+            [*command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _codex_version(
+        f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    )
+
+
 def select_codex_runner(config: Config, verify: bool = True) -> Any:
     mode = str(getattr(config, "codex_transport", "exec") or "exec").lower()
     if mode == "exec":
-        log_event("codex-transport", "using exec transport")
+        log_event("codex-transport", "使用 exec 传输")
         return CodexRunner(config)
 
     socket_path = Path(
@@ -112,9 +155,15 @@ def select_codex_runner(config: Config, verify: bool = True) -> Any:
             try:
                 info = runner.probe()
             except AppServerProtocolError as exc:
-                raise ValueError(
-                    f"Codex shared daemon socket 存在但握手失败: {exc}"
-                ) from exc
+                detail = f"Codex shared daemon socket 存在但握手失败: {exc}"
+                if mode == "app-server":
+                    raise ValueError(detail) from exc
+                log_event(
+                    "codex-transport",
+                    f"回退使用 exec：{detail}",
+                    level="WARNING",
+                )
+                return CodexRunner(config)
             user_agent = str(info.get("userAgent") or "unknown")
             normalized_user_agent = user_agent.casefold()
             official_daemon = normalized_user_agent.startswith(
@@ -129,13 +178,31 @@ def select_codex_runner(config: Config, verify: bool = True) -> Any:
                     raise ValueError(detail)
                 log_event(
                     "codex-transport",
-                    f"using exec fallback: {detail}",
+                    f"回退使用 exec：{detail}",
                     level="WARNING",
                 )
                 return CodexRunner(config)
+            daemon_version = _codex_version(user_agent)
+            if mode == "auto":
+                command_version = _configured_codex_version(config)
+                if (
+                    daemon_version
+                    and command_version
+                    and daemon_version != command_version
+                ):
+                    detail = (
+                        "shared daemon 版本与 CODEX_COMMAND 不一致: "
+                        f"daemon={daemon_version}, command={command_version}"
+                    )
+                    log_event(
+                        "codex-transport",
+                        f"回退使用 exec：{detail}",
+                        level="WARNING",
+                    )
+                    return CodexRunner(config)
             log_event(
                 "codex-transport",
-                f"using app-server socket={socket_path} userAgent={user_agent}",
+                f"使用 app-server：socket={socket_path}，userAgent={user_agent}",
             )
             runner.probe_info = info
         return runner
@@ -145,8 +212,8 @@ def select_codex_runner(config: Config, verify: bool = True) -> Any:
             raise ValueError("Codex shared daemon 当前不支持 Windows")
         raise ValueError(f"未找到 Codex shared daemon socket: {socket_path}")
 
-    reason = "unsupported platform" if not supported else f"socket missing: {socket_path}"
-    log_event("codex-transport", f"using exec fallback: {reason}", level="WARNING")
+    reason = "当前平台不支持" if not supported else f"socket 不存在：{socket_path}"
+    log_event("codex-transport", f"回退使用 exec：{reason}", level="WARNING")
     return CodexRunner(config)
 
 
@@ -189,14 +256,23 @@ class BridgeService:
             self.outbox_wakeup = threading.Event()
             self._runtime_lock = threading.Lock()
             self._outbox_image_lock = threading.RLock()
+            self._task_worker_lock = threading.Lock()
+            self._task_queues: Dict[str, "queue.Queue[str]"] = {}
+            self._task_workers: Dict[str, threading.Thread] = {}
+            self._active_runners: Dict[str, Any] = {}
+            self._runner_threads: Dict[str, str] = {}
+            self._worker_states: Dict[str, Dict[str, str]] = {}
+            self._worker_context = threading.local()
+            self._idle_checkpoint_lock = threading.Lock()
+            self._busy_worker_count = 0
             self.channel_states: Dict[str, str] = {}
             self.channel_details: Dict[str, str] = {}
             self.worker_stage = "idle"
             self.current_job_id = ""
             self.last_worker_error = ""
             self.worker = threading.Thread(
-                target=self._worker_loop,
-                name="codex-worker",
+                target=self._dispatch_loop,
+                name="codex-dispatcher",
                 daemon=True,
             )
             self.outbox_worker = threading.Thread(
@@ -242,7 +318,7 @@ class BridgeService:
             self._cleanup_unreferenced_outbox_images()
             self._restore_persisted_jobs()
             if discarded_outbox:
-                log_event("recovery", f"discarded_outbox={discarded_outbox}")
+                log_event("recovery", f"已丢弃发件箱通知数={discarded_outbox}")
         except BaseException:
             self.instance_lock.release()
             raise
@@ -251,7 +327,7 @@ class BridgeService:
         if self._fatal_shutdown_requested.is_set():
             return
         self._fatal_shutdown_requested.set()
-        log_event("bridge", f"fatal shutdown requested: {reason}", level="ERROR")
+        log_event("bridge", f"已请求致命错误停机：{reason}", level="ERROR")
         self.stop_event.set()
         self.outbox_wakeup.set()
         threading.Thread(
@@ -262,7 +338,7 @@ class BridgeService:
         ).start()
 
     def run(self) -> None:
-        log_event("bridge", "service starting")
+        log_event("bridge", "服务正在启动")
         try:
             with self._stop_state_lock:
                 if self._stop_started.is_set():
@@ -280,7 +356,7 @@ class BridgeService:
             else:
                 log_event(
                     "bridge",
-                    "instance lock retained because shutdown did not complete cleanly",
+                    "服务未完整停止，继续保留实例锁",
                     level="ERROR",
                 )
 
@@ -290,9 +366,16 @@ class BridgeService:
             if first_request:
                 self._stop_started.set()
         if not first_request:
-            if force_if_running and self.runner.running():
-                log_event("bridge", "second stop request: cancelling Codex task", level="WARNING")
-                self.runner.cancel()
+            if force_if_running:
+                runners = self._running_runners()
+                if runners:
+                    log_event(
+                        "bridge",
+                        f"收到第二次停止请求，正在取消 {len(runners)} 个 Codex 任务",
+                        level="WARNING",
+                    )
+                    for runner in runners:
+                        runner.cancel()
             self._stop_complete.wait()
             return
         self.stop_event.set()
@@ -307,7 +390,7 @@ class BridgeService:
                     channels.stop_all()
             except Exception as exc:
                 clean = False
-                log_event("bridge", f"channel stop failed: {exc}", level="ERROR")
+                log_event("bridge", f"停止渠道失败：{exc}", level="ERROR")
             channel_threads = getattr(self, "channel_threads", {})
             for channel_name, channel_thread in channel_threads.items():
                 try:
@@ -320,20 +403,20 @@ class BridgeService:
                     clean = False
                     log_event(
                         "bridge",
-                        f"{channel_name} gateway stop failed: {exc}",
+                        f"停止 {channel_name} Gateway 失败：{exc}",
                         level="ERROR",
                     )
             try:
                 if self.worker.is_alive() and threading.current_thread() is not self.worker:
-                    if self.runner.running():
+                    if self._running_runners():
                         log_event(
                             "bridge",
-                            "waiting for current Codex task; send stop again to cancel",
+                            "正在等待活动 Codex 任务结束；再次发送停止请求可取消任务",
                         )
                     self.worker.join()
             except Exception as exc:
                 clean = False
-                log_event("bridge", f"worker stop failed: {exc}", level="ERROR")
+                log_event("bridge", f"停止 Worker 失败：{exc}", level="ERROR")
             outbox_worker = getattr(self, "outbox_worker", None)
             try:
                 if (
@@ -344,13 +427,23 @@ class BridgeService:
                     outbox_worker.join()
             except Exception as exc:
                 clean = False
-                log_event("bridge", f"outbox stop failed: {exc}", level="ERROR")
+                log_event("bridge", f"停止发件箱 Worker 失败：{exc}", level="ERROR")
             try:
                 self.monitor.stop()
             except Exception as exc:
                 clean = False
-                log_event("bridge", f"monitor stop failed: {exc}", level="ERROR")
+                log_event("bridge", f"停止会话监听器失败：{exc}", level="ERROR")
+            task_workers = self._task_worker_snapshot()
+            for task_worker in task_workers:
+                try:
+                    if task_worker.is_alive() and threading.current_thread() is not task_worker:
+                        task_worker.join()
+                except Exception as exc:
+                    clean = False
+                    log_event("bridge", f"停止任务 Worker 失败：{exc}", level="ERROR")
             if self.worker.is_alive():
+                clean = False
+            if any(task_worker.is_alive() for task_worker in task_workers):
                 clean = False
             if outbox_worker is not None and outbox_worker.is_alive():
                 clean = False
@@ -362,7 +455,7 @@ class BridgeService:
         finally:
             self._components_stopped = clean
             self._stop_complete.set()
-            log_event("bridge", "service stopped")
+            log_event("bridge", "服务已停止")
 
     def _restore_persisted_jobs(self) -> None:
         recoverable, uncertain = self.store.recover_jobs()
@@ -384,15 +477,87 @@ class BridgeService:
         if recoverable or uncertain:
             log_event(
                 "recovery",
-                f"queued={len(recoverable)} interrupted={len(uncertain)}",
+                f"已恢复排队任务数={len(recoverable)}，已中断不确定任务数={len(uncertain)}",
             )
 
-    def _set_worker_state(self, stage: str, job_id: str = "", error: str = "") -> None:
+    def _task_worker_snapshot(self) -> List[threading.Thread]:
+        lock = getattr(self, "_task_worker_lock", None)
+        workers = getattr(self, "_task_workers", {})
+        if lock is None:
+            return []
+        with lock:
+            return list(workers.values())
+
+    def _running_runners(self) -> List[Any]:
+        lock = getattr(self, "_task_worker_lock", None)
+        active = getattr(self, "_active_runners", {})
+        if lock is None:
+            runner = getattr(self, "runner", None)
+            return [runner] if runner is not None and runner.running() else []
+        with lock:
+            unique = {id(runner): runner for runner in active.values() if runner.running()}
+        return list(unique.values())
+
+    def _runner_for_thread(self, thread_id: str) -> Optional[Any]:
+        lock = getattr(self, "_task_worker_lock", None)
+        if lock is None:
+            runner = getattr(self, "runner", None)
+            return runner if runner is not None and runner.running() else None
+        with lock:
+            matches = [
+                runner
+                for lane_key, runner in self._active_runners.items()
+                if (
+                    lane_key == thread_id
+                    or self._runner_threads.get(lane_key) == thread_id
+                )
+                and runner.running()
+            ]
+        return matches[0] if matches else None
+
+    def _register_runner_thread(self, thread_id: str, runner: Any) -> None:
+        lock = getattr(self, "_task_worker_lock", None)
+        if lock is None or not thread_id:
+            return
+        lane_key = str(getattr(getattr(self, "_worker_context", None), "lane_key", ""))
+        if not lane_key:
+            return
+        with lock:
+            if self._active_runners.get(lane_key) is runner:
+                self._runner_threads[lane_key] = thread_id
+
+    def _set_worker_busy(self, busy: bool) -> None:
+        with self._runtime_lock:
+            count = int(getattr(self, "_busy_worker_count", 0))
+            self._busy_worker_count = max(0, count + (1 if busy else -1))
+            if self._busy_worker_count:
+                self.worker_busy.set()
+            else:
+                self.worker_busy.clear()
+
+    def _set_worker_state(
+        self,
+        stage: str,
+        job_id: str = "",
+        error: str = "",
+        thread_id: str = "",
+    ) -> None:
+        lane_key = str(getattr(getattr(self, "_worker_context", None), "lane_key", ""))
         with self._runtime_lock:
             self.worker_stage = stage
             self.current_job_id = job_id
             if error:
                 self.last_worker_error = error[-400:]
+            states = getattr(self, "_worker_states", None)
+            if isinstance(states, dict) and lane_key:
+                if stage == "idle":
+                    states.pop(lane_key, None)
+                else:
+                    states[lane_key] = {
+                        "stage": stage,
+                        "job_id": job_id,
+                        "thread_id": thread_id or lane_key,
+                    }
 
     def _on_channel_state(self, channel: str, state: str, detail: str) -> None:
         with self._runtime_lock:
@@ -414,7 +579,7 @@ class BridgeService:
         except (OSError, ValueError) as exc:
             log_event(
                 "attachments",
-                f"cleanup rejected or failed: {exc}",
+                f"附件清理被拒绝或失败：{exc}",
                 level="ERROR",
             )
 
@@ -520,7 +685,7 @@ class BridgeService:
             self.outbox_wakeup.set()
             return True
         except Exception as exc:
-            log_event("chat-outbox", f"enqueue failed: {exc}", level="ERROR")
+            log_event("chat-outbox", f"通知入队失败：{exc}", level="ERROR")
             return False
 
     def _text_outbox_specs(
@@ -643,7 +808,7 @@ class BridgeService:
                     success = False
                     log_event(
                         f"{target.channel}-image",
-                        f"enqueue failed: {exc}",
+                        f"图片通知入队失败：{exc}",
                         level="ERROR",
                     )
                 finally:
@@ -714,7 +879,7 @@ class BridgeService:
                     except OSError:
                         pass
             except (OSError, ValueError, sqlite3.Error) as exc:
-                log_event("qq-image", f"spool cleanup failed: {exc}", level="WARNING")
+                log_event("qq-image", f"图片暂存目录清理失败：{exc}", level="WARNING")
 
     def _image_outbox_specs(
         self,
@@ -738,7 +903,7 @@ class BridgeService:
                 if path.stat().st_size > limits.attachment_max_bytes:
                     log_event(
                         f"{target.channel}-image",
-                        f"skipped oversized image: {path.name}",
+                        f"已跳过超出大小限制的图片：{path.name}",
                         level="WARNING",
                     )
                     continue
@@ -820,8 +985,8 @@ class BridgeService:
                     )
                     log_event(
                         "chat-outbox",
-                        f"delivery failed channel={item.channel} id={item.outbox_id} "
-                        f"retry_in={delay}s error={detail}",
+                        f"通知发送失败：渠道={item.channel}，编号={item.outbox_id}，"
+                        f"{delay} 秒后重试，错误={detail}",
                         level="ERROR",
                     )
                     self.store.retry_outbox(item.outbox_id, detail, delay)
@@ -832,20 +997,20 @@ class BridgeService:
                         self._cleanup_unreferenced_outbox_images()
                     log_event(
                         "chat-outbox",
-                        f"delivered channel={item.channel} id={item.outbox_id}",
+                        f"通知已发送：渠道={item.channel}，编号={item.outbox_id}",
                     )
                     time.sleep(0.35)
             except Exception as exc:
                 log_event(
                     "chat-outbox",
-                    f"worker recovered from storage error: {exc}",
+                    f"Worker 已从存储错误中恢复：{exc}",
                     level="ERROR",
                 )
                 self.stop_event.wait(2)
 
     def _on_channel_ready(self, channel_name: str) -> None:
         self._on_channel_state(channel_name, "ready", "")
-        log_event("bridge", f"{channel_name} channel is ready")
+        log_event("bridge", f"{channel_name} 渠道已就绪")
         channel = self.channels.get(channel_name)
         if not channel.notify_on_ready:
             return
@@ -863,7 +1028,7 @@ class BridgeService:
             if queued:
                 self._online_notice_sent.add(channel_name)
         else:
-            log_event("bridge", f"{channel_name} waiting for /bind <code>")
+            log_event("bridge", f"{channel_name} 正在等待 /bind <code> 绑定")
 
     def _bind(self, event: InboundMessage) -> None:
         content = event.content
@@ -884,21 +1049,78 @@ class BridgeService:
             event.message_id,
             actions=self._main_actions(),
         )
-        log_event("bridge", f"{event.channel} user binding completed")
+        log_event("bridge", f"{event.channel} 用户绑定完成")
 
     def _status_text(self) -> str:
         active = self.active_thread.snapshot()
-        path = self.monitor.path or find_session_file(
-            self.config.codex_sessions_dir, active.thread_id
-        )
-        busy = path is not None and self._session_busy_without_checkpoint(path)
+        path = find_session_file(self.config.codex_sessions_dir, active.thread_id)
+        app_server = getattr(self.runner, "transport_name", "exec") == "app-server"
+        runtime_status = ""
+        runtime_flags: tuple[str, ...] = ()
+        if app_server:
+            try:
+                runtime = self.runner.thread_runtime(active.thread_id)
+                runtime_status = runtime.status
+                runtime_flags = runtime.active_flags
+            except Exception as exc:
+                log_event(
+                    "app-server-status",
+                    f"thread/read 失败：任务={active.thread_id}：{exc}",
+                    level="WARNING",
+                )
+                runtime_status = "unavailable"
+        try:
+            writer_locked = codex_writer_lock_held(active.thread_id)
+            writer_lock_state = "已占用" if writer_locked else "未占用"
+        except Exception as exc:
+            log_event(
+                "writer-lock-status",
+                f"探测失败：任务={active.thread_id}：{exc}",
+                level="WARNING",
+            )
+            writer_lock_state = "未知"
         queue_size = self.store.active_job_count()
         pending_notifications = self.store.pending_outbox_count()
         latest_job = self.store.latest_job()
         with self._runtime_lock:
             channel_states = dict(self.channel_states)
+            worker_states = dict(getattr(self, "_worker_states", {}))
             worker_stage = self.worker_stage
             last_worker_error = self.last_worker_error
+        current_runner = self._runner_for_thread(active.thread_id)
+        selected_stages = sorted(
+            {
+                str(value.get("stage") or "")
+                for value in worker_states.values()
+                if value.get("thread_id") == active.thread_id and value.get("stage")
+            }
+        )
+        if selected_stages:
+            bridge_state = "处理中（" + "，".join(selected_stages) + "）"
+        elif current_runner is not None:
+            bridge_state = "执行中"
+        else:
+            bridge_state = "无活动回合"
+        if app_server:
+            state_labels = {
+                "active": "active",
+                "idle": "idle",
+                "notLoaded": "notLoaded（未由该 daemon 加载）",
+                "systemError": "系统错误",
+                "unavailable": "不可用",
+            }
+            daemon_state = state_labels.get(runtime_status, "未知")
+        else:
+            daemon_state = "未连接"
+        running_count = len(self._running_runners())
+        active_stages = sorted(
+            {
+                str(value.get("stage") or "")
+                for value in worker_states.values()
+                if value.get("stage")
+            }
+        )
+        stages_text = "，".join(active_stages) if active_stages else worker_stage
         safe_error = ""
         if last_worker_error:
             safe_error, _images = qq_safe_final(last_worker_error, active.workdir, max_images=0)
@@ -907,9 +1129,17 @@ class BridgeService:
                 "Codex Chat Bridge 状态",
                 f"标题：{self._short_title(active.title, 60)}",
                 f"任务：{active.thread_id}",
-                f"Codex：{'执行中' if busy or self.runner.running() else '空闲'}",
+                f"Bridge 当前任务：{bridge_state}",
+                f"共享 App Server：{daemon_state}",
+                (
+                    "共享 App Server 活动标记：" + "，".join(runtime_flags)
+                    if runtime_flags
+                    else "共享 App Server 活动标记：无"
+                ),
+                f"本机 writer 锁：{writer_lock_state}（不代表回合忙闲）",
+                f"Bridge 运行回合：{running_count}",
                 f"传输：{getattr(self.runner, 'transport_name', 'exec')}",
-                f"Worker 阶段：{worker_stage}",
+                f"Worker 阶段：{stages_text}",
                 f"最近任务状态：{latest_job.status if latest_job else '无'}",
                 f"持久任务：{queue_size}",
                 "渠道："
@@ -937,10 +1167,11 @@ class BridgeService:
                 "/new <第一条消息>：在当前项目中新建任务",
                 "/status：查看任务和队列状态",
                 "/recent：查看最近一次 Codex 最终结果",
-                "/cancel：取消由聊天渠道启动的当前任务",
+                "/steer <补充目标>：修改 Bridge 自己启动的 App Server 回合",
+                "/cancel：终止 Bridge 自己启动的回合",
                 "/help：查看帮助",
-                "桌面任务执行中发送的新消息会自动排队。",
-                "可随时切换到空闲任务；新建任务不受现有桌面任务状态影响。",
+                "普通消息通过 Codex 官方队列继续原任务；同一任务按顺序执行。",
+                "可随时切换任务；切换不会改变已经入队消息的目标。",
             ]
         )
 
@@ -1059,10 +1290,6 @@ class BridgeService:
         )
         return self._actions(rows)
 
-    def _thread_is_busy(self, thread_id: str) -> bool:
-        path = find_session_file(self.config.codex_sessions_dir, thread_id)
-        return path is not None and self._session_busy_without_checkpoint(path)
-
     def _switch_thread(self, selector: str) -> str:
         if not selector:
             return "用法：/use 编号或完整 UUID"
@@ -1075,8 +1302,6 @@ class BridgeService:
             info = self.thread_index.get(selector)
         if info is None:
             return "没有找到该任务。先发送 /threads 查看编号。"
-        if self._thread_is_busy(info.thread_id):
-            return "目标任务仍在执行，结束后才能切换。"
         self.active_thread.switch(info)
         lines = [
             f"已切换：{self._short_title(info.title, 60)}",
@@ -1147,7 +1372,7 @@ class BridgeService:
         accepted_text: str,
     ) -> bool:
         if self.stop_event.is_set():
-            log_event("bridge", "ignored remote job during shutdown")
+            log_event("bridge", "停机期间已忽略远程任务")
             return False
         message_id = event.message_id
         event_key = f"{event.channel}:{message_id}"
@@ -1169,7 +1394,7 @@ class BridgeService:
             if self.stop_event.is_set():
                 if attachment_dir:
                     self._cleanup_job_attachments({"attachment_dir": attachment_dir})
-                log_event("bridge", "deferred remote job acceptance during shutdown")
+                log_event("bridge", "停机期间已延后接受远程任务")
                 return False
             payload: Dict[str, Any] = {
                 **event.recipient.to_payload(),
@@ -1203,13 +1428,13 @@ class BridgeService:
                 message_id,
                 start_seq=2,
             )
-            log_event("job-store", f"accept failed: {exc}", level="ERROR")
+            log_event("job-store", f"接受任务失败：{exc}", level="ERROR")
             return False
         if created:
             self.jobs.put_nowait(job.job_id)
             log_event(
                 "job-store",
-                f"accepted job={job.job_id} action={action} thread={thread_id}",
+                f"已接受任务：任务编号={job.job_id}，操作={action}，Codex 任务={thread_id}",
             )
         self._safe_send(
             event.recipient,
@@ -1234,7 +1459,7 @@ class BridgeService:
 
     def _on_channel_event(self, event: InboundMessage) -> None:
         if self.stop_event.is_set():
-            log_event("bridge", f"ignored {event.channel} event during shutdown")
+            log_event("bridge", f"停机期间已忽略 {event.channel} 事件")
             return
         recipient = event.recipient
         content = event.content.strip()
@@ -1252,7 +1477,7 @@ class BridgeService:
         if recipient != bound:
             log_event(
                 "bridge",
-                f"blocked message from unbound {event.channel} user",
+                f"已拦截未绑定的 {event.channel} 用户消息",
                 level="WARNING",
             )
             return
@@ -1383,12 +1608,51 @@ class BridgeService:
                     actions=self._main_actions(),
                 )
             return
+        if command == "/steer":
+            if not argument:
+                self._safe_send(
+                    recipient,
+                    "用法：/steer 要追加到当前回合的目标",
+                    event.message_id,
+                )
+                return
+            active = self.active_thread.snapshot()
+            runner = self._runner_for_thread(active.thread_id)
+            if (
+                runner is None
+                or getattr(runner, "transport_name", "exec") != "app-server"
+            ):
+                self._safe_send(
+                    recipient,
+                    "当前没有由 Bridge 启动且可修改的 App Server 回合。"
+                    "Bridge 不能跨进程修改 Desktop 回合；直接发送普通消息可加入下一回合队列。",
+                    event.message_id,
+                )
+                return
+            try:
+                steered = runner.steer_thread(
+                    active.thread_id,
+                    argument,
+                )
+                message = (
+                    "补充目标已追加到当前 Codex 回合。"
+                    if steered
+                    else "当前任务没有正在执行的回合。"
+                )
+            except Exception as exc:
+                log_event("app-server-steer", str(exc), level="ERROR")
+                message = f"追加目标失败：{summarize_codex_error(str(exc))}"
+            self._safe_send(recipient, message, event.message_id)
+            return
         if command == "/cancel":
-            cancelled = self.runner.cancel()
+            active = self.active_thread.snapshot()
+            runner = self._runner_for_thread(active.thread_id)
+            cancelled = runner.cancel() if runner is not None else False
             message = (
-                "已请求取消聊天渠道启动的当前任务。"
+                "已请求终止 Bridge 启动的当前 Codex 回合。"
                 if cancelled
-                else "当前没有可取消的聊天渠道任务。"
+                else "当前没有由 Bridge 启动且可终止的回合。"
+                "Bridge 不能跨进程终止 Desktop 回合。"
             )
             self._safe_send(recipient, message, event.message_id)
             return
@@ -1449,18 +1713,16 @@ class BridgeService:
             accepted_text="已接收并保存，等待 Bridge 调度当前 Codex 任务。",
         )
 
-    def _wait_until_idle(self, thread_id: str) -> bool:
-        deadline = time.time() + self.config.queue_wait_timeout
-        while not self.stop_event.is_set() and time.time() < deadline:
-            path = find_session_file(self.config.codex_sessions_dir, thread_id)
-            busy = path is not None and self._session_busy_without_checkpoint(path)
-            if not busy and not self.runner.running():
-                return True
-            self.stop_event.wait(1)
-        return False
-
     def _session_busy_without_checkpoint(self, path: Path) -> bool:
         state = self.state.load()
+        checkpoints = state.get("known_idle_sessions")
+        if isinstance(checkpoints, dict):
+            try:
+                checkpoint = int(checkpoints.get(str(path), -1))
+            except (TypeError, ValueError):
+                checkpoint = -1
+            if checkpoint == path.stat().st_size:
+                return False
         if state.get("known_idle_session_path") == str(path):
             try:
                 checkpoint = int(state.get("known_idle_session_size", -1))
@@ -1480,40 +1742,162 @@ class BridgeService:
             return
         if self.active_thread.snapshot().thread_id == thread_id:
             self.monitor.mark_idle()
-        self.state.update(
-            known_idle_session_path=str(path),
-            known_idle_session_size=size,
-        )
+        lock = getattr(self, "_idle_checkpoint_lock", None)
+        if lock is None:
+            self.state.update(
+                known_idle_session_path=str(path),
+                known_idle_session_size=size,
+            )
+            return
+        with lock:
+            stored = self.state.load()
+            raw_checkpoints = stored.get("known_idle_sessions")
+            checkpoints = dict(raw_checkpoints) if isinstance(raw_checkpoints, dict) else {}
+            checkpoints[str(path)] = size
+            if len(checkpoints) > 200:
+                checkpoints = dict(list(checkpoints.items())[-200:])
+            self.state.update(
+                known_idle_sessions=checkpoints,
+                known_idle_session_path=str(path),
+                known_idle_session_size=size,
+            )
 
     def _refresh_desktop(self, thread_id: str, workdir: Optional[Path] = None) -> None:
         try:
             if self.desktop_refresher.refresh(thread_id, workdir):
                 detail = getattr(self.desktop_refresher, "last_detail", "")
-                suffix = f" detail={detail}" if isinstance(detail, str) and detail else ""
-                log_event("desktop", f"refreshed thread={thread_id}{suffix}")
+                suffix = f"，详情={detail}" if isinstance(detail, str) and detail else ""
+                log_event("desktop", f"Desktop 已刷新：任务={thread_id}{suffix}")
             elif self.config.codex_desktop_refresh:
                 detail = getattr(self.desktop_refresher, "last_detail", "")
-                suffix = f" detail={detail}" if isinstance(detail, str) and detail else ""
+                suffix = f"，详情={detail}" if isinstance(detail, str) and detail else ""
                 log_event(
                     "desktop",
-                    f"refresh skipped or failed thread={thread_id}{suffix}",
+                    f"Desktop 刷新已跳过或失败：任务={thread_id}{suffix}",
                     level="WARNING",
                 )
         except Exception:
             log_event(
                 "desktop",
-                f"refresh raised thread={thread_id}\n{traceback.format_exc()}",
+                f"Desktop 刷新出现异常：任务={thread_id}\n{traceback.format_exc()}",
             )
 
-    def _worker_loop(self) -> None:
+    def _make_worker_runner(self) -> Any:
+        if getattr(self.runner, "transport_name", "exec") == "app-server":
+            return AppServerCodexRunner(self.config)
+        return CodexRunner(self.config)
+
+    def _dispatch_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
                 job_id = self.jobs.get(timeout=0.5)
             except queue.Empty:
                 continue
+            try:
+                self._dispatch_job(job_id)
+            except sqlite3.Error as exc:
+                log_event(
+                    "job-store",
+                    f"派发查询失败，已在内存中重新排队：任务编号={job_id}：{exc}",
+                    level="ERROR",
+                )
+                if not self.stop_event.is_set():
+                    self.jobs.put_nowait(job_id)
+                self.stop_event.wait(1)
+            finally:
+                self.jobs.task_done()
+
+    def _dispatch_job(self, job_id: str) -> None:
+        job = self.store.get_job(job_id)
+        if job is None or job.status != "queued":
+            return
+        action = str(job.payload.get("action") or "resume")
+        thread_id = str(job.payload.get("thread_id") or "")
+        lane_key = f"new:{job_id}" if action == "new" else thread_id
+        if not lane_key:
+            lane_key = f"job:{job_id}"
+        with self._task_worker_lock:
+            if action != "new" and thread_id:
+                for candidate, mapped_thread_id in self._runner_threads.items():
+                    worker = self._task_workers.get(candidate)
+                    if mapped_thread_id == thread_id and worker is not None and worker.is_alive():
+                        lane_key = candidate
+                        break
+            task_queue = self._task_queues.get(lane_key)
+            task_worker = self._task_workers.get(lane_key)
+            if task_queue is None or task_worker is None or not task_worker.is_alive():
+                task_queue = queue.Queue()
+                task_worker = threading.Thread(
+                    target=self._task_worker_loop,
+                    args=(lane_key, task_queue),
+                    name=f"codex-task-{lane_key[:12]}",
+                    daemon=True,
+                )
+                self._task_queues[lane_key] = task_queue
+                self._task_workers[lane_key] = task_worker
+                task_queue.put_nowait(job_id)
+                task_worker.start()
+            else:
+                task_queue.put_nowait(job_id)
+
+    def _task_worker_loop(self, lane_key: str, task_queue: "queue.Queue[str]") -> None:
+        runner = self._make_worker_runner()
+        with self._task_worker_lock:
+            self._active_runners[lane_key] = runner
+        try:
+            while not self.stop_event.is_set():
+                self._worker_loop(
+                    job_queue=task_queue,
+                    runner=runner,
+                    lane_key=lane_key,
+                    exit_when_empty=True,
+                )
+                with self._task_worker_lock:
+                    if task_queue.empty():
+                        if self._active_runners.get(lane_key) is runner:
+                            self._active_runners.pop(lane_key, None)
+                        if self._task_queues.get(lane_key) is task_queue:
+                            self._task_queues.pop(lane_key, None)
+                        if self._task_workers.get(lane_key) is threading.current_thread():
+                            self._task_workers.pop(lane_key, None)
+                        return
+        finally:
+            with self._task_worker_lock:
+                for key, active_runner in list(self._active_runners.items()):
+                    if active_runner is runner:
+                        self._active_runners.pop(key, None)
+                        self._runner_threads.pop(key, None)
+                if self._task_queues.get(lane_key) is task_queue:
+                    self._task_queues.pop(lane_key, None)
+                if self._task_workers.get(lane_key) is threading.current_thread():
+                    self._task_workers.pop(lane_key, None)
+
+    def _worker_loop(
+        self,
+        job_queue: Optional["queue.Queue[str]"] = None,
+        runner: Optional[Any] = None,
+        lane_key: str = "",
+        exit_when_empty: bool = False,
+    ) -> None:
+        selected_queue = job_queue or self.jobs
+        selected_runner = runner or self.runner
+        worker_context = getattr(self, "_worker_context", None)
+        if worker_context is None:
+            worker_context = threading.local()
+            self._worker_context = worker_context
+        worker_context.lane_key = lane_key
+        worker_context.runner = selected_runner
+        while not self.stop_event.is_set():
+            try:
+                job_id = selected_queue.get(timeout=0.5)
+            except queue.Empty:
+                if exit_when_empty:
+                    return
+                continue
             job: Optional[StoredJob] = None
             result: Optional[JobRunResult] = None
             terminal = False
+            busy_registered = False
             stage = "prepare"
             try:
                 try:
@@ -1521,57 +1905,25 @@ class BridgeService:
                 except sqlite3.Error as exc:
                     log_event(
                         "job-store",
-                        f"claim failed; requeued in memory job={job_id}: {exc}",
+                        f"领取任务失败，已在内存中重新排队：任务编号={job_id}：{exc}",
                         level="ERROR",
                     )
                     if not self.stop_event.is_set():
-                        self.jobs.put_nowait(job_id)
+                        selected_queue.put_nowait(job_id)
                     self.stop_event.wait(1)
                     continue
                 if job is None:
                     continue
                 event = job.payload
-                self.worker_busy.set()
+                self._set_worker_busy(True)
+                busy_registered = True
                 self._set_worker_state(stage, job_id)
                 action = event.get("action", "resume")
                 target_thread_id = event.get("thread_id") or self.active_thread.snapshot().thread_id
                 log_event(
                     "worker",
-                    f"claimed job={job_id} action={action} thread={target_thread_id}",
+                    f"已领取任务：任务编号={job_id}，操作={action}，Codex 任务={target_thread_id}",
                 )
-                if action != "new":
-                    stage = "wait-for-idle"
-                    self.store.set_job_status(job_id, "waiting")
-                    self._set_worker_state(stage, job_id)
-                    path = find_session_file(self.config.codex_sessions_dir, target_thread_id)
-                    already_waiting = self.runner.running() or (
-                        path is not None and self._session_busy_without_checkpoint(path)
-                    )
-                    if already_waiting:
-                        self._safe_send(
-                            self._recipient_from_payload(event),
-                            "当前 Codex 任务仍在执行，本条消息已保存并进入等待队列。",
-                            dedupe_key=f"job:{job_id}:waiting",
-                        )
-                    if not self._wait_until_idle(target_thread_id):
-                        if self.stop_event.is_set():
-                            self.store.set_job_status(job_id, "queued")
-                            log_event("worker", f"deferred during shutdown job={job_id}")
-                            continue
-                        error = "等待当前任务结束超时，本条消息未执行。"
-                        result = JobRunResult(target_thread_id, "failed", error, error)
-                        stage = "finalize"
-                        terminal = self._persist_job_result_with_retry(job, result)
-                        if not terminal:
-                            self._set_worker_state("persistence-failed", job_id, error)
-                            continue
-                        self._set_worker_state("failed", job_id, error)
-                        log_event(
-                            "worker",
-                            f"timed out waiting job={job_id} thread={target_thread_id}",
-                            level="ERROR",
-                        )
-                        continue
                 stage = "prepare-input"
                 self.store.set_job_status(job_id, "preparing")
                 self._set_worker_state(stage, job_id)
@@ -1586,7 +1938,7 @@ class BridgeService:
                     raise FileNotFoundError(f"已保存的输入图片不存在: {', '.join(missing)}")
                 if self.stop_event.is_set():
                     self.store.set_job_status(job_id, "queued")
-                    log_event("worker", f"deferred before dispatch job={job_id}")
+                    log_event("worker", f"派发前已延后任务：任务编号={job_id}")
                     continue
                 stage = "run-codex"
                 self.store.set_job_status(job_id, "dispatching")
@@ -1599,6 +1951,7 @@ class BridgeService:
                     workdir,
                     prompt,
                     image_paths,
+                    selected_runner,
                 )
                 stage = "finalize"
                 terminal = self._persist_job_result_with_retry(job, result)
@@ -1606,7 +1959,7 @@ class BridgeService:
                     self._set_worker_state(
                         "persistence-failed",
                         job_id,
-                        result.error or "terminal persistence failed",
+                        result.error or "终态持久化失败",
                     )
                     continue
                 self._set_worker_state(
@@ -1621,15 +1974,15 @@ class BridgeService:
                     self._refresh_desktop(refreshed_thread_id, workdir)
                 log_event(
                     "worker",
-                    f"finished job={job_id} status={result.status} "
-                    f"action={action} thread={refreshed_thread_id}",
+                    f"任务已结束：任务编号={job_id}，状态={result.status}，"
+                    f"操作={action}，Codex 任务={refreshed_thread_id}",
                     level="INFO" if result.status == "succeeded" else "ERROR",
                 )
             except Exception as exc:
                 error = summarize_codex_error(str(exc), max_chars=400)
                 log_event(
                     "worker",
-                    f"failed job={job.job_id if job else job_id} stage={stage}\n"
+                    f"任务失败：任务编号={job.job_id if job else job_id}，阶段={stage}\n"
                     f"{traceback.format_exc()}",
                     level="ERROR",
                 )
@@ -1640,7 +1993,7 @@ class BridgeService:
                     except Exception as status_exc:
                         log_event(
                             "job-store",
-                            f"failed to inspect job state id={job.job_id}: {status_exc}",
+                            f"检查任务状态失败：任务编号={job.job_id}：{status_exc}",
                             level="ERROR",
                         )
                     if result is None:
@@ -1652,13 +2005,17 @@ class BridgeService:
                             workdir,
                             max_images=0,
                         )
-                        uncertain = isinstance(exc, JobDispatchUncertainError) or (
-                            persisted is not None and persisted.status == "running"
-                        )
+                        uncertain = isinstance(
+                            exc,
+                            (
+                                JobDispatchUncertainError,
+                                CodexQueueDispatchUncertainError,
+                            ),
+                        ) or (persisted is not None and persisted.status == "running")
                         if uncertain:
                             status = "interrupted"
                             message = (
-                                "Codex 子进程已经启动，但 Bridge 无法确认任务是否完整执行。"
+                                "消息可能已经投递到 Codex，但 Bridge 无法确认任务是否完整执行。"
                                 "为避免重复操作，请先检查任务记录后再决定是否重试。\n"
                                 f"详情：{safe_detail}"
                             )
@@ -1680,9 +2037,10 @@ class BridgeService:
             finally:
                 if terminal and job is not None:
                     self._cleanup_job_attachments(job.payload)
-                self.worker_busy.clear()
+                if busy_registered:
+                    self._set_worker_busy(False)
                 self._set_worker_state("idle")
-                self.jobs.task_done()
+                selected_queue.task_done()
 
     def _persist_job_result_with_retry(
         self,
@@ -1696,14 +2054,14 @@ class BridgeService:
             except Exception as exc:
                 log_event(
                     "job-store",
-                    f"terminal persistence attempt={attempt} job={job.job_id}: {exc}",
+                    f"终态持久化失败：尝试次数={attempt}，任务编号={job.job_id}：{exc}",
                     level="ERROR",
                 )
                 if attempt == 1:
                     time.sleep(0.2)
         self._cleanup_unreferenced_outbox_images()
         self._request_fatal_shutdown(
-            f"job={job.job_id} terminal persistence failed twice"
+            f"任务编号={job.job_id}，终态持久化连续两次失败"
         )
         return False
 
@@ -1761,7 +2119,7 @@ class BridgeService:
         try:
             indexed = self.thread_index.get(result.thread_id)
         except sqlite3.Error as exc:
-            log_event("thread-index", f"result lookup failed: {exc}", level="WARNING")
+            log_event("thread-index", f"结果任务查询失败：{exc}", level="WARNING")
             indexed = None
         if indexed is not None:
             return indexed
@@ -1774,9 +2132,10 @@ class BridgeService:
         event: Dict[str, Any],
         action: str,
         process_id: Optional[int],
+        runner: Optional[Any] = None,
     ) -> None:
-        runner = getattr(self, "runner", None)
-        shared_daemon = getattr(runner, "transport_name", "exec") == "app-server"
+        selected_runner = runner or getattr(self, "runner", None)
+        shared_daemon = getattr(selected_runner, "transport_name", "exec") == "app-server"
         if shared_daemon:
             message = (
                 "Codex 共享回合已启动，正在创建新任务。"
@@ -1803,7 +2162,38 @@ class BridgeService:
             raise JobDispatchUncertainError(
                 "Codex 已启动，但 Bridge 无法持久化启动状态"
             ) from exc
-        self._set_worker_state("running", job_id)
+        active_thread_id = ""
+        if action == "new" and selected_runner is not None:
+            active_thread = getattr(selected_runner, "active_thread_id", None)
+            if callable(active_thread):
+                active_thread_id = str(active_thread() or "")
+                self._register_runner_thread(active_thread_id, selected_runner)
+        self._set_worker_state(
+            "running",
+            job_id,
+            thread_id=active_thread_id or str(event.get("thread_id") or ""),
+        )
+
+    def _on_job_queued_to_codex(
+        self,
+        job_id: str,
+        event: Dict[str, Any],
+        thread_id: str,
+    ) -> None:
+        try:
+            self._set_job_status_with_notification(
+                job_id,
+                "running",
+                "",
+                self._recipient_from_payload(event),
+                "消息已写入当前 Codex 任务的官方队列；如果当前回合仍在执行，将在其结束后继续。",
+                dedupe_key=f"job:{job_id}:codex-queued",
+            )
+        except Exception as exc:
+            raise JobDispatchUncertainError(
+                "消息已写入 Codex 队列，但 Bridge 无法持久化排队状态"
+            ) from exc
+        self._set_worker_state("waiting-codex-queue", job_id, thread_id=thread_id)
 
     def _on_codex_diagnostic(
         self,
@@ -1864,7 +2254,11 @@ class BridgeService:
             message = "Codex 报告网络连接异常，CLI 可能正在自动重试。"
         elif any(
             marker in lowered
-            for marker in ("desktop interaction required", "approval required")
+            for marker in (
+                "desktop interaction required",
+                "approval required",
+                "需要 desktop 交互",
+            )
         ):
             category = "approval"
             message = "Codex 正在等待桌面端交互或审批，请打开对应任务处理。"
@@ -1872,7 +2266,7 @@ class BridgeService:
             return
         log_event(
             "codex-diagnostic",
-            f"job={job_id} category={category} detail={filtered}",
+            f"任务编号={job_id}，类别={category}，详情={filtered}",
             level="WARNING",
         )
         self._safe_send(
@@ -1943,7 +2337,7 @@ class BridgeService:
         except OSError as exc:
             log_event(
                 "session-event",
-                f"failed to identify terminal event thread={thread_id}: {exc}",
+                f"识别终态事件失败：任务={thread_id}：{exc}",
                 level="WARNING",
             )
             return ""
@@ -1969,6 +2363,149 @@ class BridgeService:
                 return event_id
             time.sleep(0.05)
 
+    def _wait_for_queued_turn_result(
+        self,
+        thread_id: str,
+        prompt: str,
+        checkpoint: tuple[Optional[Path], int],
+        workdir: Path,
+    ) -> JobRunResult:
+        deadline = time.monotonic() + self.config.codex_turn_timeout
+        current_path, current_offset = checkpoint
+        matched_input = False
+        current_turn_id = ""
+        matched_turn_id = ""
+        final_message = ""
+        final_event_id = ""
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set():
+                raise JobDispatchUncertainError(
+                    "消息已写入 Codex 队列，但 Bridge 在等待结果时停止"
+                )
+            path = find_session_file(self.config.codex_sessions_dir, thread_id)
+            if path is not None:
+                try:
+                    path = path.resolve()
+                    offset = current_offset if current_path == path else 0
+                    if offset > path.stat().st_size:
+                        offset = 0
+                    with path.open("rb") as handle:
+                        handle.seek(offset)
+                        while True:
+                            line_start = handle.tell()
+                            line = handle.readline()
+                            if not line:
+                                break
+                            if not line.endswith(b"\n"):
+                                handle.seek(line_start)
+                                break
+                            try:
+                                record = json.loads(line)
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                continue
+                            if not isinstance(record, dict):
+                                continue
+                            payload = (
+                                record.get("payload")
+                                if record.get("type") == "event_msg"
+                                else None
+                            )
+                            event_type = (
+                                str(payload.get("type") or "")
+                                if isinstance(payload, dict)
+                                else ""
+                            )
+                            turn_id = record_turn_id(record)
+                            if event_type == "task_started":
+                                current_turn_id = turn_id
+                            message = user_message_from_record(record)
+                            if message == prompt:
+                                matched_input = True
+                                if not matched_turn_id:
+                                    matched_turn_id = turn_id or current_turn_id
+                                continue
+                            if not matched_input:
+                                continue
+                            final = final_message_from_record(record)
+                            if final:
+                                final_message = final
+                                final_event_id = session_record_event_id(
+                                    path,
+                                    line_start,
+                                    record,
+                                )
+                                continue
+                            if (
+                                isinstance(payload, dict)
+                                and event_type == "turn_aborted"
+                                and (
+                                    not matched_turn_id
+                                    or not turn_id
+                                    or turn_id == matched_turn_id
+                                )
+                            ):
+                                detail = str(
+                                    payload.get("reason")
+                                    or payload.get("message")
+                                    or "Codex 任务已中断"
+                                ).strip()
+                                safe_detail, _images = qq_safe_final(
+                                    detail,
+                                    workdir,
+                                    max_images=0,
+                                )
+                                return JobRunResult(
+                                    thread_id,
+                                    "interrupted",
+                                    detail,
+                                    f"Codex 队列任务已中断：\n{safe_detail}",
+                                    event_id=session_record_event_id(
+                                        path,
+                                        line_start,
+                                        record,
+                                    ),
+                                )
+                            if event_type in {"task_complete", "turn_complete"} and (
+                                not matched_turn_id
+                                or not turn_id
+                                or turn_id == matched_turn_id
+                            ):
+                                if final_message:
+                                    return JobRunResult(
+                                        thread_id,
+                                        "succeeded",
+                                        final_message=final_message,
+                                        event_id=final_event_id,
+                                    )
+                                detail = "Codex 队列回合已结束，但没有找到最终文本。"
+                                return JobRunResult(
+                                    thread_id,
+                                    "interrupted",
+                                    detail,
+                                    detail,
+                                    event_id=session_record_event_id(
+                                        path,
+                                        line_start,
+                                        record,
+                                    ),
+                                )
+                        current_path = path
+                        current_offset = handle.tell()
+                except OSError as exc:
+                    log_event(
+                        "codex-queue",
+                        f"读取会话记录失败：任务={thread_id}：{exc}",
+                        level="WARNING",
+                    )
+            self.stop_event.wait(0.25)
+        detail = "消息已写入 Codex 队列，但等待对应回合结果超时。"
+        return JobRunResult(
+            thread_id,
+            "interrupted",
+            detail,
+            f"{detail}为避免重复执行，Bridge 不会自动重发。",
+        )
+
     def _run_job(
         self,
         job_id: str,
@@ -1978,7 +2515,9 @@ class BridgeService:
         workdir: Path,
         prompt: str,
         image_paths: List[Path],
+        runner: Optional[Any] = None,
     ) -> JobRunResult:
+        selected_runner = runner or self.runner
         result_thread_id = target_thread_id
         checkpoint = (
             self._rollout_checkpoint(target_thread_id)
@@ -1990,15 +2529,16 @@ class BridgeService:
             event,
             action,
             process_id,
+            selected_runner,
         )
         on_diagnostic = lambda line: self._on_codex_diagnostic(job_id, event, line)
         if action == "new":
             log_event(
                 "codex",
-                f"new cwd={workdir} chars={len(prompt)} images={len(image_paths)}",
+                f"新建任务：工作目录={workdir}，字符数={len(prompt)}，图片数={len(image_paths)}",
             )
             title = self._short_title(prompt, 80)
-            code, new_thread_id, final, stderr = self.runner.run_new(
+            code, new_thread_id, final, stderr = selected_runner.run_new(
                 prompt,
                 workdir,
                 image_paths,
@@ -2008,6 +2548,7 @@ class BridgeService:
             )
             if new_thread_id:
                 result_thread_id = new_thread_id
+                self._register_runner_thread(new_thread_id, selected_runner)
                 switched = self.active_thread.switch_if_current(
                     target_thread_id,
                     ThreadInfo(new_thread_id, title, workdir.resolve()),
@@ -2029,17 +2570,27 @@ class BridgeService:
                 )
         else:
             log_event(
-                "codex",
-                f"resume thread={target_thread_id} chars={len(prompt)} "
-                f"images={len(image_paths)}",
+                "codex-queue",
+                f"正在提交：任务={target_thread_id}，字符数={len(prompt)}，"
+                f"图片数={len(image_paths)}",
             )
-            code, final, stderr = self.runner.run(
-                prompt,
+            queue_codex_message(
+                self.config,
                 target_thread_id,
+                prompt,
                 workdir,
                 image_paths,
-                on_started=on_started,
-                on_diagnostic=on_diagnostic,
+            )
+            self._on_job_queued_to_codex(job_id, event, target_thread_id)
+            log_event(
+                "codex-queue",
+                f"提交成功：任务编号={job_id}，Codex 任务={target_thread_id}",
+            )
+            return self._wait_for_queued_turn_result(
+                target_thread_id,
+                prompt,
+                checkpoint,
+                workdir,
             )
         if code != 0:
             event_id = self._wait_for_rollout_event_id(
@@ -2047,7 +2598,7 @@ class BridgeService:
                 checkpoint,
                 event_type="turn_aborted",
             )
-            reason = self.runner.termination_reason()
+            reason = selected_runner.termination_reason()
             if reason == "timed_out":
                 status = "timed_out"
                 detail = summarize_codex_error(stderr)
@@ -2282,7 +2833,7 @@ class BridgeService:
 
 def check_installation(config: Config) -> int:
     errors = []
-    transport = "unknown"
+    transport = "未知"
     transport_detail = ""
     state = StateStore(config.base_dir / "data" / "state.json").load()
     stored_id = str(state.get("active_thread_id") or "")
@@ -2315,38 +2866,42 @@ def check_installation(config: Config) -> int:
             timeout=10,
             check=False,
         )
-        version = (completed.stdout or "").strip() or "unknown"
+        version = (completed.stdout or "").strip() or "未知"
     except Exception as exc:
         errors.append(f"Codex 命令检查失败: {exc}")
-        version = "unknown"
+        version = "未知"
+    try:
+        verify_codex_queue_support(config)
+    except Exception as exc:
+        errors.append(f"Codex queue 检查失败: {exc}")
     print(f"Codex: {version}")
     print(
-        f"Transport: {transport}"
+        f"传输方式：{transport}"
         + (f" ({transport_detail})" if transport_detail else "")
     )
-    print(f"Thread: {thread_id}")
-    print(f"Session: {path or 'not found'}")
-    print(f"State DB: {config.codex_state_db}")
-    print(f"Channels: {','.join(config.enabled_channels)}")
+    print(f"当前任务：{thread_id}")
+    print(f"会话文件：{path or '未找到'}")
+    print(f"状态数据库：{config.codex_state_db}")
+    print(f"已启用渠道：{','.join(config.enabled_channels)}")
     for line in channel_configuration_summary(config, config.enabled_channels):
         print(line)
     if errors:
         for error in errors:
-            print(f"ERROR: {error}", file=sys.stderr)
+            print(f"错误：{error}", file=sys.stderr)
         return 1
-    print("Local check passed. Network and channel credentials have not been tested.")
+    print("本地检查通过。尚未测试网络连接和渠道凭证。")
     return 0
 
 
 def main() -> int:
     configure_log_file(BASE_DIR / "data" / "logs" / "bridge.jsonl")
-    parser = argparse.ArgumentParser(description="Bridge Codex Desktop tasks to chat channels")
-    parser.add_argument("--check", action="store_true", help="validate local configuration only")
+    parser = argparse.ArgumentParser(description="将 Codex Desktop 任务桥接到聊天渠道")
+    parser.add_argument("--check", action="store_true", help="仅验证本地配置")
     args = parser.parse_args()
     try:
         config = Config.from_env(BASE_DIR, require_channel_credentials=True)
     except ValueError as exc:
-        log_event("bridge", f"configuration error: {exc}", level="ERROR")
+        log_event("bridge", f"配置错误：{exc}", level="ERROR")
         print(f"配置错误：{exc}", file=sys.stderr)
         return 2
     if args.check:
@@ -2354,7 +2909,7 @@ def main() -> int:
     try:
         service = BridgeService(config)
     except Exception as exc:
-        log_event("bridge", f"startup failed: {exc}", level="ERROR")
+        log_event("bridge", f"启动失败：{exc}", level="ERROR")
         print(f"启动失败：{exc}", file=sys.stderr)
         return 2
 
@@ -2370,14 +2925,14 @@ def main() -> int:
     active = service.active_thread.snapshot()
     log_event(
         "bridge",
-        f"starting thread={active.thread_id} cwd={active.workdir}",
+        f"正在启动：任务={active.thread_id}，工作目录={active.workdir}",
     )
     try:
         service.run()
     except Exception as exc:
         log_event(
             "bridge",
-            f"service failed: {exc}\n{traceback.format_exc()}",
+            f"服务异常退出：{exc}\n{traceback.format_exc()}",
             level="ERROR",
         )
         print(f"Bridge 异常退出：{exc}", file=sys.stderr)

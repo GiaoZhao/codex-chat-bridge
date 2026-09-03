@@ -6,8 +6,8 @@
 - 任一用户可见的 Codex Desktop 任务产生最终结果后，桥接器都把任务标题和结果主动发送
   到所有已绑定渠道；包括由 Codex 拉起的可见委派任务，guardian、内部 subagent 和已归档
   任务不会推送。
-- 在 QQ 或钉钉私聊机器人发送普通文字后，macOS 可通过 standalone Codex shared daemon 直接在
-  Desktop 对应任务中启动回合；shared daemon 不可用时可回退 `codex exec resume`。
+- 在 QQ 或钉钉私聊机器人发送普通文字后，Bridge 通过官方 `codex queue` 将消息写入
+  Desktop 对应任务的跨进程队列；普通消息始终使用入队时选中的原任务 UUID，不自动新建任务。
 - 可从任一已启用渠道列出桌面端任务、切换任务，或在当前项目目录中新建任务。
 - QQ 回复优先使用 Markdown 卡片和快捷按钮，失败时自动回退到纯文本。
 - 钉钉回复优先使用内置 AI 互动卡片，快捷操作显示为原生按钮并通过 Stream 回调；
@@ -32,8 +32,8 @@ QQ 或钉钉 SDK。`channel_factory.py` 是唯一的渠道装配点，按 `BRIDG
 `dingtalk_gateway.py`，两者不相互 import。
 
 每个渠道独立管理连接状态、绑定、消息限额、图片处理和 outbox 领取。某个渠道断线时，
-另一个已就绪渠道仍会继续发送。各渠道操作的是同一个 Codex 任务索引、“当前任务”和串行
-执行队列，因此从任一渠道执行 `/use` 都会改变其他渠道后续消息所进入的任务。
+另一个已就绪渠道仍会继续发送。各渠道操作的是同一个 Codex 任务索引、“当前任务”和
+按任务隔离的执行队列，因此从任一渠道执行 `/use` 都会改变其他渠道后续消息所进入的任务。
 
 ## 演进方向
 
@@ -42,24 +42,29 @@ QQ 或钉钉 SDK。`channel_factory.py` 是唯一的渠道装配点，按 `BRIDG
 - 在 Codex 提供稳定的外部控制接口后，替换当前 CLI resume 与 Desktop 刷新方案。
 
 已确认的客户端产品边界、电源管理行为和验收标准见
-[Desktop Client Requirements](docs/desktop-client-requirements.md)。
+[Desktop 客户端需求](docs/desktop-client-requirements.md)。
 
 ## 当前实现边界
 
-本实现已在 macOS、standalone Codex `0.146.0` 和 Codex Desktop shared daemon 上验证。
-使用 shared daemon 时，Bridge 与 Desktop 连接同一个 app-server：QQ 发起的用户消息、
-执行过程和最终回复会实时出现在 Desktop 对应任务中；`/new` 会把首条消息摘要显式设置为
-任务标题。桌面任务仍保存在 `~/.codex/sessions` 原生会话文件中。
+本实现已在 macOS 和 bundled Codex `0.150.0-alpha.12.2` 上验证。已有任务的普通消息通过
+官方 `codex queue` 写入原 UUID 的跨进程队列；Desktop 消费后，用户消息、执行过程和最终
+回复会出现在对应任务中。桌面任务仍保存在 `~/.codex/sessions` 原生会话文件中。
 
 shared daemon 目前是 Codex 的实验能力，版本变化和账号策略可能带来兼容性差异。Bridge
 手动运行时默认使用 `CODEX_TRANSPORT=auto`：macOS 检测到由官方 Codex 客户端建立的
-control socket 时使用 `app-server`，否则回退 `codex exec`。LaunchAgent 默认使用
-`exec`，不会自行 bootstrap shared daemon，避免 Bridge 被上游识别为非官方客户端。
-`exec` 模式不保证 Desktop 实时显示 QQ 回合。
+control socket 时可使用 `app-server` 创建 Bridge 自己的新任务，否则回退 `codex exec`。
+macOS LaunchAgent 也默认使用 `auto`。已有任务的普通消息不依赖这个 transport 选择，也不先
+调用 `thread/read` 或 `thread/resume`。
+
+Desktop 的 stdio app-server 与 shared daemon 是不同进程；一个进程返回的 `idle` 或
+`notLoaded` 不能证明另一个进程是否正在执行，也不能绕过其 writer lock。因此 `/status` 会
+分别显示 Bridge 自身回合、shared daemon 状态和本机 writer lock，不把任何一项冒充 Desktop
+真实忙闲。`/steer` 和 `/cancel` 只作用于 Bridge 自己启动并仍在跟踪的回合，不能跨进程修改或
+终止 Desktop 回合。普通消息排队成功后，Bridge 按 rollout 中匹配输入的 turn 边界等待最终
+记录并用事件 ID 去重回传；投递结果不确定时不会自动重发。
 
 Windows 的配置、命令路径、PowerShell 启动和核心桥接路径已有兼容处理，但目前没有
-Windows 真机端到端验证结论，且当前固定回退 `codex exec`，不能保证 Desktop 实时显示
-QQ 新回合。旧路径只写入原生会话文件，Desktop 可能不会立刻刷新。Bridge 在所有传输模式
+Windows 真机端到端验证结论；使用前必须确认当地 Codex CLI 提供 `codex queue`。Bridge 在所有传输模式
 下都不连接调试端口、不操作页面、不清理缓存、不重载 renderer；`CODEX_DESKTOP_REFRESH`
 只是保留配置，即使设为 `1` 也不会执行 Desktop 操作。
 
@@ -70,8 +75,8 @@ QQ Gateway 建立 READY 会话时的“Bridge 已上线”消息默认关闭，�
 通知。如需启动提醒，将 `.env` 中的 `QQ_NOTIFY_ON_READY` 设为 `1`；同一 Bridge 进程
 即使重连多次也只发送一次。
 
-QQ 发起任务时会依次区分“已接收并保存”“等待已有任务”和“Codex 回合已启动”；只有
-成功创建 shared daemon 回合或 Codex 子进程后才会发送第三种回执。任务队列和待发送通知保存在
+QQ 发起已有任务时会先回执“已接收并保存”，写入官方队列后再明确回执；`/new` 只有成功
+创建 App Server 回合或 Codex 子进程后才会发送启动回执。任务队列和待发送通知保存在
 `data/bridge.sqlite3`。Bridge 运行期间遇到 QQ 或网络短暂断开时会继续重试；Bridge 重启时
 会恢复尚未派发的任务，但会丢弃上个进程没有发出的旧通知，避免上线后集中补发。为避免
 重复执行，已进入派发或运行阶段但被异常中断的任务不会自动重跑，而会在 QQ 中提示人工
@@ -80,7 +85,7 @@ QQ 发起任务时会依次区分“已接收并保存”“等待已有任务�
 
 运行日志写入 `data/logs/bridge.jsonl`，单文件达到 2MB 后轮转，保留 5 份历史文件。
 回执语义、重启恢复边界、错误通知能力和取日志步骤见
-[Reliability and Troubleshooting](docs/reliability.md)。
+[可靠性与故障排查](docs/reliability.md)。
 
 全部任务通知使用 Codex 只读任务索引取得用户可见任务，并为每个 rollout 文件保存独立
 字节游标。每次启动都在当时最后一条完整 JSONL 记录之后建立新基线，不补发 Bridge 停止
@@ -115,12 +120,17 @@ cd codex-chat-bridge
 ./scripts/macos-service.sh install
 ```
 
-默认安装使用官方 `codex exec`，优先保证账号兼容性和后台可靠性。若账号允许 Bridge
-作为 app-server 客户端，且 Desktop 已经建立 shared daemon，可改用
-`./scripts/macos-service.sh install --transport auto`。`auto` 只接受 `userAgent` 以
-`Codex Desktop/` 或 `codex-cli/` 开头的 daemon；socket 缺失或身份不符合时回退 `exec`。
-`--transport app-server` 为严格模式，条件不满足时启动失败。Bridge 不会自行 bootstrap
-daemon，也不会伪装成官方客户端。
+默认安装使用 `auto`，并在停止旧服务前检查配置的 Codex CLI 是否提供 `codex queue`。
+control socket 缺失、握手失败或版本不一致时，`/new` 回退 `codex exec`；已有任务仍直接走
+官方 queue，不会调用 `codex exec resume` 与 Desktop 争用 writer。
+
+`auto` 在握手后会比较 shared daemon 的版本与 `CODEX_COMMAND --version`；发现版本不一致时
+回退到 `exec`。只有显式执行 `install --transport app-server` 时，安装器才调用官方 bundled
+Codex CLI 的 `daemon bootstrap`，LaunchAgent 启动时才执行 `daemon start`。严格模式仍只用于
+Bridge 自己创建的回合，不能据此控制 Desktop 的 stdio App Server。
+
+`--transport exec`、`auto` 和 `app-server` 只决定 `/new` 等由 Bridge 自己执行的回合使用哪种
+transport，不改变已有任务普通消息的 queue 路径。
 
 LaunchAgent 使用 `RunAtLoad` 和 `KeepAlive` 管理 Bridge，登录后自动启动，异常退出后自动
 拉起，不依赖终端或 Codex 工具会话。macOS 不允许后台 LaunchAgent 直接读取受保护的
@@ -130,7 +140,7 @@ LaunchAgent 使用 `RunAtLoad` 和 `KeepAlive` 管理 Bridge，登录后自动�
 ```bash
 ./scripts/macos-service.sh status
 ./scripts/macos-service.sh restart
-./scripts/macos-service.sh install --transport auto
+./scripts/macos-service.sh install --transport app-server
 ./scripts/macos-service.sh uninstall
 ```
 
@@ -260,7 +270,8 @@ DINGTALK_BIND_CODE=your-one-time-bind-code
 /new 内容   在当前项目目录中新建任务，并把“内容”作为第一条消息
 /status    查看 Codex、队列和会话状态
 /recent    查看最近一次最终结果
-/cancel    取消由聊天渠道启动的当前任务
+/steer 内容  向当前正在执行的回合追加目标
+/cancel    终止当前正在执行的回合
 /help      查看帮助
 ```
 
@@ -272,10 +283,13 @@ DINGTALK_BIND_CODE=your-one-time-bind-code
 新选择的任务。
 `/new` 必须带第一条消息；新任务标题取该消息的前 80 个字符。新建任务不等待当前或
 其他 Desktop 任务结束；如果创建期间当前任务选择没有变化，创建完成后会自动切换到
-新任务，否则保留用户后来选择的任务。`/use` 只检查准备切换到的目标任务：只要目标
-任务空闲，即使当前任务或其他任务仍在执行，也可以立即切换；已经入队的消息仍保留
-入队时的目标任务，不会因之后切换而串线。Bridge 自身仍使用单 worker，聊天渠道任务
-之间按入队顺序串行执行。
+新任务，否则保留用户后来选择的任务。`/use` 始终只更新当前选择，即使目标任务仍在
+执行也可以立即切换；已经入队的消息仍保留入队时的目标 UUID，不会因之后切换而串线。
+Bridge 为每个任务维护独立执行通道：同一任务的消息严格按入队顺序串行，不同任务可以
+并行执行。新建任务取得 UUID 后，后续消息也会回到该任务原有通道。普通消息始终通过官方
+queue 写入当前 UUID，并在已有回合结束后继续。`/steer` 和 `/cancel` 只控制 Bridge 自己启动
+且仍在跟踪的回合，不影响其他任务，也不尝试控制 Desktop 回合。`/status` 分开显示 Bridge
+回合、shared daemon 局部状态、writer lock 和运行回合数。
 
 QQ 入站图片仅接受 HTTPS 图片附件，默认每张最大 20MB、每条最多 3 张。临时下载文件
 会在本次 Codex 执行结束后删除。Codex 回复中的 Markdown 本地图片只允许来自当前任务
@@ -303,7 +317,7 @@ Windows PowerShell：
 .\scripts\run.ps1 --check
 ```
 
-`--check` 只检查本机配置、依赖、Codex 命令和会话文件，不连接 QQ 或钉钉。
+`--check` 只检查本机配置、依赖、Codex 命令、`codex queue` 能力和会话文件，不连接 QQ 或钉钉。
 真正启动时才会使用各渠道凭证获取 token 并建立 Gateway/Stream 连接。
 
 ## 安全

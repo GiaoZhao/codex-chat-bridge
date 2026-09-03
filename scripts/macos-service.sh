@@ -6,7 +6,7 @@ BASE_DIR="${SCRIPT_DIR:h}"
 PYTHON_BIN="${BASE_DIR}/.venv/bin/python"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
-  echo "Missing .venv. Run scripts/setup.sh first." >&2
+  echo "缺少 .venv，请先运行 scripts/setup.sh。" >&2
   exit 2
 fi
 

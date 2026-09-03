@@ -27,12 +27,12 @@ class QQChannel:
     @staticmethod
     def configuration_summary(config: Config) -> Tuple[str, ...]:
         return (
-            f"QQ AppID: {'configured' if config.qq_app_id else 'missing'}",
-            "QQ binding: "
+            f"QQ AppID：{'已配置' if config.qq_app_id else '缺失'}",
+            "QQ 绑定："
             + (
-                "configured"
+                "已配置"
                 if config.qq_allowed_openid or config.qq_bind_code
-                else "missing"
+                else "缺失"
             ),
         )
 
@@ -159,7 +159,7 @@ class QQChannel:
                 )
             except Exception as exc:
                 detail = self.redact_error(exc, recipient_id)
-                log_event("qq-markdown", f"fallback: {detail}", level="WARNING")
+                log_event("qq-markdown", f"Markdown 发送失败，降级为纯文本：{detail}", level="WARNING")
                 self.api.send_c2c(
                     recipient_id,
                     text,

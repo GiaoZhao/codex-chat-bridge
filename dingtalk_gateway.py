@@ -427,11 +427,11 @@ class _DingTalkCardCallbackHandler(_CallbackHandlerBase):
             event = extract_dingtalk_card_event(callback.data, message_id)
             if event is not None:
                 self._enqueue(event)
-                log_event("dingtalk-card", "callback accepted")
+                log_event("dingtalk-card", "回调已接受")
             else:
                 log_event(
                     "dingtalk-card",
-                    "callback ignored: missing bridge command; shape="
+                    "回调已忽略：缺少 Bridge 命令；结构="
                     + _dingtalk_card_callback_shape(callback.data),
                     level="WARNING",
                 )
@@ -505,7 +505,7 @@ class DingTalkGatewayClient:
             try:
                 self.on_message(event)
             except Exception as exc:
-                log_event("dingtalk-event", f"handler failed: {exc}", level="ERROR")
+                log_event("dingtalk-event", f"事件处理失败：{exc}", level="ERROR")
             finally:
                 self._events.task_done()
 
@@ -520,13 +520,13 @@ class DingTalkGatewayClient:
             self._emit_state("connecting")
             connection = await asyncio.to_thread(self.stream_client.open_connection)
             if not connection:
-                self._emit_state("error", "open connection failed")
+                self._emit_state("error", "建立连接失败")
                 await self._wait_before_reconnect(5)
                 continue
             endpoint = str(connection.get("endpoint") or "")
             ticket = str(connection.get("ticket") or "")
             if not endpoint or not ticket:
-                self._emit_state("error", "connection response incomplete")
+                self._emit_state("error", "连接响应不完整")
                 await self._wait_before_reconnect(5)
                 continue
             uri = f"{endpoint}?ticket={quote_plus(ticket)}"
@@ -598,13 +598,13 @@ class DingTalkChannel:
     @staticmethod
     def configuration_summary(config: Config) -> Tuple[str, ...]:
         return (
-            "DingTalk Client ID: "
-            + ("configured" if config.dingtalk_client_id else "missing"),
-            "DingTalk binding: "
+            "钉钉 Client ID："
+            + ("已配置" if config.dingtalk_client_id else "缺失"),
+            "钉钉绑定："
             + (
-                "configured"
+                "已配置"
                 if config.dingtalk_allowed_user_id or config.dingtalk_bind_code
-                else "missing"
+                else "缺失"
             ),
         )
 
@@ -735,7 +735,7 @@ class DingTalkChannel:
         except Exception as exc:
             log_event(
                 "dingtalk-card",
-                f"fallback: {self.redact_error(exc, recipient_id)}",
+                f"互动卡片发送失败，降级处理：{self.redact_error(exc, recipient_id)}",
                 level="WARNING",
             )
 
@@ -745,7 +745,7 @@ class DingTalkChannel:
         except Exception as exc:
             log_event(
                 "dingtalk-markdown",
-                f"fallback: {self.redact_error(exc, recipient_id)}",
+                f"Markdown 发送失败，降级为纯文本：{self.redact_error(exc, recipient_id)}",
                 level="WARNING",
             )
             self.api.send_text(recipient_id, self._with_actions(text, actions))

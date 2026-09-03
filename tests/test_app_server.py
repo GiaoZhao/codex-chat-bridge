@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -12,11 +13,16 @@ from typing import Callable, Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
 
 from bridge import select_codex_runner
-from bridge_core import CodexRunner
+from bridge_core import (
+    CodexQueueDispatchUncertainError,
+    CodexRunner,
+    queue_codex_message,
+)
 from codex_app_server import (
     AppServerCodexRunner,
     AppServerProtocolError,
     AppServerRPCClient,
+    AppServerThreadRuntime,
     AppServerUnavailableError,
 )
 
@@ -126,6 +132,7 @@ class ScriptedClient:
 def runner_config(root: Path, *, timeout: int = 60) -> SimpleNamespace:
     return SimpleNamespace(
         codex_app_server_socket=root / "app-server.sock",
+        codex_command=("/opt/codex",),
         codex_thread_id=THREAD_ID,
         codex_workdir=root,
         codex_turn_timeout=timeout,
@@ -138,6 +145,41 @@ def resume_responses() -> dict:
         "thread/resume": {"thread": {"id": THREAD_ID}},
         "turn/start": {"turn": {"id": TURN_ID}},
     }
+
+
+def thread_read_response(status: str, active_turn_id: str = "") -> dict:
+    turns = []
+    if active_turn_id:
+        turns.append(
+            {
+                "id": active_turn_id,
+                "status": "inProgress",
+                "items": [],
+            }
+        )
+    value = {"type": status}
+    if status == "active":
+        value["activeFlags"] = []
+    return {
+        "thread": {
+            "id": THREAD_ID,
+            "status": value,
+            "turns": turns,
+        }
+    }
+
+
+def thread_turns_response(active_turn_id: str = "") -> dict:
+    turns = []
+    if active_turn_id:
+        turns.append(
+            {
+                "id": active_turn_id,
+                "status": "inProgress",
+                "items": [],
+            }
+        )
+    return {"data": turns, "nextCursor": None, "backwardsCursor": None}
 
 
 class RPCClientTests(unittest.TestCase):
@@ -205,8 +247,133 @@ class RPCClientTests(unittest.TestCase):
 
         raw_socket.close.assert_called_once()
 
-
 class AppServerRunnerTests(unittest.TestCase):
+    def test_queue_helper_uses_the_official_cross_process_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            image = root / "input.png"
+            image.write_bytes(b"png")
+            config = runner_config(root)
+
+            with patch("bridge_core.subprocess.run") as run:
+                run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+                queue_codex_message(config, THREAD_ID, "来自 QQ 的消息", root, [image])
+
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "/opt/codex",
+                    "queue",
+                    "--thread",
+                    THREAD_ID,
+                    "--message",
+                    "来自 QQ 的消息",
+                    "-i",
+                    str(image.resolve()),
+                ],
+            )
+            self.assertEqual(run.call_args.kwargs["cwd"], str(root.resolve()))
+
+    def test_queue_timeout_is_reported_as_an_uncertain_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            with patch(
+                "bridge_core.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("codex", 15),
+            ):
+                with self.assertRaises(CodexQueueDispatchUncertainError):
+                    queue_codex_message(
+                        runner_config(root),
+                        THREAD_ID,
+                        "来自 QQ 的消息",
+                        root,
+                    )
+
+    def test_thread_runtime_distinguishes_loaded_idle_from_active(self) -> None:
+        cases = [
+            ("idle", "", AppServerThreadRuntime("idle")),
+            ("notLoaded", "", AppServerThreadRuntime("notLoaded")),
+            ("active", TURN_ID, AppServerThreadRuntime("active", TURN_ID)),
+        ]
+        for status, turn_id, expected in cases:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as raw_dir:
+                client = ScriptedClient(
+                    {
+                        "initialize": {"userAgent": "codex-cli/0.150.0"},
+                        "thread/read": thread_read_response(status, turn_id),
+                        "thread/turns/list": thread_turns_response(turn_id),
+                    }
+                )
+                runner = AppServerCodexRunner(
+                    runner_config(Path(raw_dir)), client_factory=lambda: client
+                )
+
+                runtime = runner.thread_runtime(THREAD_ID)
+
+                self.assertEqual(runtime, expected)
+                read_call = next(call for call in client.calls if call[1] == "thread/read")
+                self.assertEqual(
+                    read_call[2],
+                    {"threadId": THREAD_ID, "includeTurns": False},
+                )
+                turn_calls = [
+                    call for call in client.calls if call[1] == "thread/turns/list"
+                ]
+                if status == "active":
+                    self.assertEqual(
+                        turn_calls[0][2],
+                        {
+                            "threadId": THREAD_ID,
+                            "limit": 1,
+                            "sortDirection": "desc",
+                            "itemsView": "notLoaded",
+                        },
+                    )
+                else:
+                    self.assertEqual(turn_calls, [])
+
+    def test_active_runtime_requires_the_in_progress_turn_id(self) -> None:
+        client = ScriptedClient(
+            {
+                "initialize": {"userAgent": "codex-cli/0.150.0"},
+                "thread/read": thread_read_response("active"),
+                "thread/turns/list": thread_turns_response(),
+            }
+        )
+        runner = AppServerCodexRunner(
+            SimpleNamespace(codex_app_server_socket=Path("/tmp/app.sock")),
+            client_factory=lambda: client,
+        )
+
+        with self.assertRaisesRegex(AppServerProtocolError, "活动回合编号"):
+            runner.thread_runtime(THREAD_ID)
+
+    def test_steer_uses_the_runtime_turn_as_a_precondition(self) -> None:
+        steer_client = ScriptedClient(
+            {
+                "initialize": {"userAgent": "codex-cli/0.150.0"},
+                "turn/steer": {"turnId": TURN_ID},
+            }
+        )
+        runner = AppServerCodexRunner(
+            SimpleNamespace(codex_app_server_socket=Path("/tmp/app.sock")),
+            client_factory=lambda: steer_client,
+        )
+        runner._active_thread_id = THREAD_ID
+        runner._active_turn_id = TURN_ID
+
+        self.assertTrue(runner.steer_thread(THREAD_ID, "补充目标"))
+
+        steer_call = next(call for call in steer_client.calls if call[1] == "turn/steer")
+        self.assertEqual(
+            steer_call[2],
+            {
+                "threadId": THREAD_ID,
+                "input": [{"type": "text", "text": "补充目标"}],
+                "expectedTurnId": TURN_ID,
+            },
+        )
+
     def test_resume_returns_current_turn_final_and_completes_handshake(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -369,7 +536,7 @@ class AppServerRunnerTests(unittest.TestCase):
         self.assertEqual(
             diagnostics,
             [
-                "desktop interaction required: "
+                "需要 Desktop 交互："
                 "item/commandExecution/requestApproval"
             ],
         )
@@ -377,7 +544,7 @@ class AppServerRunnerTests(unittest.TestCase):
     def test_failed_and_external_interrupted_statuses_are_distinct(self) -> None:
         cases = [
             ("failed", {"message": "upstream failed"}, 1, "upstream failed", ""),
-            ("interrupted", None, -15, "turn status: interrupted", "interrupted"),
+            ("interrupted", None, -15, "回合状态：interrupted", "interrupted"),
         ]
         for status, error, code, detail, reason in cases:
             with self.subTest(status=status), tempfile.TemporaryDirectory() as raw_dir:
@@ -498,6 +665,11 @@ class TransportSelectionTests(unittest.TestCase):
             codex_app_server_socket=Path("/tmp/app-server.sock"),
         )
 
+    def versioned_config(self, mode: str) -> SimpleNamespace:
+        config = self.config(mode)
+        config.codex_command = ("/Applications/ChatGPT.app/Contents/Resources/codex",)
+        return config
+
     def test_exec_mode_never_probes_socket(self) -> None:
         with patch("bridge.AppServerCodexRunner") as app_runner:
             runner = select_codex_runner(self.config("exec"))
@@ -526,6 +698,41 @@ class TransportSelectionTests(unittest.TestCase):
 
         self.assertIsInstance(runner, CodexRunner)
 
+    def test_auto_falls_back_when_daemon_version_differs(self) -> None:
+        app_runner = Mock()
+        app_runner.probe.return_value = {"userAgent": "codex-cli/0.146.0"}
+        command_result = Mock(stdout="codex-cli 0.150.0-alpha.12.2", stderr="")
+        with patch("bridge.Path.is_socket", return_value=True), patch(
+            "bridge.AppServerCodexRunner", return_value=app_runner
+        ), patch("bridge.subprocess.run", return_value=command_result) as run:
+            runner = select_codex_runner(self.versioned_config("auto"))
+
+        self.assertIsInstance(runner, CodexRunner)
+        run.assert_called_once_with(
+            ["/Applications/ChatGPT.app/Contents/Resources/codex", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+
+    def test_explicit_app_server_accepts_daemon_version_mismatch(self) -> None:
+        app_runner = Mock()
+        app_runner.probe.return_value = {"userAgent": "Codex Desktop/0.146.0"}
+        with patch("bridge.Path.is_socket", return_value=True), patch(
+            "bridge.AppServerCodexRunner", return_value=app_runner
+        ), patch(
+            "bridge.subprocess.run",
+            return_value=Mock(stdout="codex-cli 0.150.0-alpha.12.2", stderr=""),
+        ) as run:
+            runner = select_codex_runner(self.versioned_config("app-server"))
+
+        self.assertIs(runner, app_runner)
+        app_runner.probe.assert_called_once()
+        # app-server 传输由 shared daemon 提供；不需要 exec 回退时，
+        # exec 命令的版本与严格 app-server 模式无关。
+        self.assertEqual(run.call_count, 0)
+
     def test_explicit_app_server_rejects_non_official_daemon_identity(self) -> None:
         app_runner = Mock()
         app_runner.probe.return_value = {"userAgent": "codex-chat-bridge/0.146.0"}
@@ -535,14 +742,24 @@ class TransportSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "不是由 Codex 官方客户端建立"):
                 select_codex_runner(self.config("app-server"))
 
-    def test_existing_socket_with_failed_handshake_does_not_fallback(self) -> None:
+    def test_auto_falls_back_when_existing_socket_handshake_fails(self) -> None:
+        app_runner = Mock()
+        app_runner.probe.side_effect = AppServerProtocolError("bad handshake")
+        with patch("bridge.Path.is_socket", return_value=True), patch(
+            "bridge.AppServerCodexRunner", return_value=app_runner
+        ):
+            runner = select_codex_runner(self.config("auto"))
+
+        self.assertIsInstance(runner, CodexRunner)
+
+    def test_explicit_app_server_rejects_failed_handshake(self) -> None:
         app_runner = Mock()
         app_runner.probe.side_effect = AppServerProtocolError("bad handshake")
         with patch("bridge.Path.is_socket", return_value=True), patch(
             "bridge.AppServerCodexRunner", return_value=app_runner
         ):
             with self.assertRaisesRegex(ValueError, "握手失败"):
-                select_codex_runner(self.config("auto"))
+                select_codex_runner(self.config("app-server"))
 
     def test_auto_falls_back_to_exec_without_socket(self) -> None:
         with patch("bridge.Path.is_socket", return_value=False):

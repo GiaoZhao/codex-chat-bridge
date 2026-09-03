@@ -7,7 +7,7 @@ $bridge = Join-Path $baseDir "bridge.py"
 $bridgeArgs = @($args)
 
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
-    throw "Missing .venv. Run .\scripts\setup.ps1 first."
+    throw "缺少 .venv，请先运行 .\scripts\setup.ps1。"
 }
 
 & $venvPython $bridge @bridgeArgs

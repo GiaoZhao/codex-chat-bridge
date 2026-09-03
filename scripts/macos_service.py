@@ -84,7 +84,7 @@ def resolve_codex_binary(base_dir: Path) -> Path:
     )
     command = shlex.split(raw_command, posix=True)
     if not command:
-        raise RuntimeError("CODEX_COMMAND is empty")
+        raise RuntimeError("CODEX_COMMAND 为空")
     executable = Path(command[0]).expanduser()
     if executable.parent != Path("."):
         candidate = executable.absolute()
@@ -93,14 +93,51 @@ def resolve_codex_binary(base_dir: Path) -> Path:
     discovered = shutil.which(command[0])
     if discovered:
         return Path(discovered).absolute()
-    raise RuntimeError(f"Codex executable not found: {command[0]}")
+    raise RuntimeError(f"未找到 Codex 可执行文件：{command[0]}")
+
+
+def validate_codex_queue(command: List[str]) -> None:
+    try:
+        completed = subprocess.run(
+            [*command, "queue", "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"无法检查 `codex queue`：{exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stdout or "").strip()[-500:] or "未知错误"
+        raise RuntimeError(f"Codex CLI 不支持 `codex queue`：{detail}")
 
 
 def launch_runtime(runtime_dir: Path, python_bin: Path) -> int:
-    transport = os.environ.get("CODEX_TRANSPORT", "exec").strip().lower() or "exec"
+    transport = (
+        os.environ.get("CODEX_TRANSPORT", "auto").strip().lower()
+        or "auto"
+    )
     if transport not in TRANSPORTS:
-        raise RuntimeError(f"unsupported Codex transport: {transport}")
+        raise RuntimeError(f"不支持的 Codex 传输方式：{transport}")
     os.environ["CODEX_TRANSPORT"] = transport
+    raw_command = os.environ.get("CODEX_COMMAND", "codex")
+    command = shlex.split(raw_command, posix=True)
+    if not command:
+        raise RuntimeError("CODEX_COMMAND 为空")
+    validate_codex_queue(command)
+    if transport == "app-server":
+        launchctl(["setenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON", "1"])
+        subprocess.run(
+            [*command, "app-server", "daemon", "start"],
+            check=True,
+            timeout=30,
+        )
+    else:
+        launchctl(
+            ["unsetenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON"],
+            check=False,
+        )
     os.execv(
         "/usr/bin/caffeinate",
         [
@@ -117,10 +154,10 @@ def build_plist(
     runtime_dir: Path,
     python_bin: Path,
     codex_bin: Path,
-    transport: str = "exec",
+    transport: str = "auto",
 ) -> Dict[str, object]:
     if transport not in TRANSPORTS:
-        raise ValueError(f"unsupported Codex transport: {transport}")
+        raise ValueError(f"不支持的 Codex 传输方式：{transport}")
     resolved = runtime_dir.resolve()
     logs_dir = resolved / "data" / "logs"
     return {
@@ -262,7 +299,7 @@ def service_loaded() -> bool:
 
 def instance_lock_held(lock_path: Path) -> bool:
     if fcntl is None:
-        raise RuntimeError("file locking is unavailable on this platform")
+        raise RuntimeError("当前平台不支持文件锁")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -287,7 +324,7 @@ def wait_for_instance_stop(lock_path: Path, timeout: float = 15.0) -> bool:
 
 def validate_installation(base_dir: Path) -> None:
     if sys.platform != "darwin":
-        raise RuntimeError("macOS LaunchAgent management is only available on macOS")
+        raise RuntimeError("macOS LaunchAgent 管理仅支持 macOS")
     required = [
         base_dir / ".venv" / "bin" / "python",
         base_dir / ".env",
@@ -295,31 +332,44 @@ def validate_installation(base_dir: Path) -> None:
     ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
-        raise RuntimeError("missing required files: " + ", ".join(missing))
+        raise RuntimeError("缺少必要文件：" + ", ".join(missing))
 
 
 def install(
     source_dir: Path,
     runtime_dir: Path,
     plist_path: Path,
-    transport: str = "exec",
+    transport: str = "auto",
 ) -> int:
     validate_installation(source_dir)
+    if transport not in TRANSPORTS:
+        raise RuntimeError(f"不支持的 Codex 传输方式：{transport}")
     codex_bin = resolve_codex_binary(source_dir)
     source_lock = source_dir / "data" / "bridge.lock"
     runtime_lock = runtime_dir / "data" / "bridge.lock"
-    if service_loaded():
-        launchctl(["bootout", service_target()])
-        if runtime_lock.exists() and not wait_for_instance_stop(runtime_lock):
-            raise RuntimeError("existing LaunchAgent did not release the Bridge lock")
-    elif runtime_lock.exists() and instance_lock_held(runtime_lock):
+    loaded = service_loaded()
+    if not loaded and runtime_lock.exists() and instance_lock_held(runtime_lock):
         raise RuntimeError(
-            "an unmanaged Bridge instance is running; stop it before installing the LaunchAgent"
+            "检测到未由 LaunchAgent 管理的 Bridge 实例，请先停止后再安装"
         )
     if source_lock.exists() and instance_lock_held(source_lock):
         raise RuntimeError(
-            "a Bridge instance is running from the source directory; stop it before installing"
+            "检测到从源码目录运行的 Bridge 实例，请先停止后再安装"
         )
+
+    validate_codex_queue([str(codex_bin)])
+    if transport == "app-server":
+        launchctl(["setenv", "CODEX_APP_SERVER_USE_LOCAL_DAEMON", "1"])
+        subprocess.run(
+            [str(codex_bin), "app-server", "daemon", "bootstrap"],
+            check=True,
+            timeout=30,
+        )
+
+    if loaded:
+        launchctl(["bootout", service_target()])
+        if runtime_lock.exists() and not wait_for_instance_stop(runtime_lock):
+            raise RuntimeError("现有 LaunchAgent 未释放 Bridge 锁")
 
     deploy_runtime(source_dir, runtime_dir, dependency_source())
     write_plist(
@@ -334,18 +384,18 @@ def install(
     launchctl(["bootstrap", launch_domain(), str(plist_path)])
     launchctl(["enable", service_target()])
     launchctl(["kickstart", "-k", service_target()])
-    print(f"Installed and started {service_target()}")
-    print(f"Plist: {plist_path}")
-    print(f"Runtime: {runtime_dir}")
-    print(f"Transport: {transport}")
+    print(f"已安装并启动 {service_target()}")
+    print(f"配置文件：{plist_path}")
+    print(f"运行目录：{runtime_dir}")
+    print(f"传输方式：{transport}")
     return 0
 
 
 def restart() -> int:
     if not service_loaded():
-        raise RuntimeError("LaunchAgent is not loaded; run install first")
+        raise RuntimeError("LaunchAgent 尚未加载，请先运行 install")
     launchctl(["kickstart", "-k", service_target()])
-    print(f"Restarted {service_target()}")
+    print(f"已重启 {service_target()}")
     return 0
 
 
@@ -354,29 +404,29 @@ def uninstall(runtime_dir: Path, plist_path: Path) -> int:
     if service_loaded():
         launchctl(["bootout", service_target()])
         if lock_path.exists() and not wait_for_instance_stop(lock_path):
-            raise RuntimeError("LaunchAgent did not release the Bridge lock")
+            raise RuntimeError("LaunchAgent 未释放 Bridge 锁")
     if plist_path.exists():
         plist_path.unlink()
-    print(f"Uninstalled {service_target()}")
-    print(f"Runtime data preserved at {runtime_dir}")
+    print(f"已卸载 {service_target()}")
+    print(f"运行数据保留在 {runtime_dir}")
     return 0
 
 
 def status() -> int:
     if not service_loaded():
-        print(f"Not loaded: {service_target()}")
+        print(f"尚未加载：{service_target()}")
         return 1
     return launchctl(["print", service_target()]).returncode
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manage the macOS QQ Bridge LaunchAgent")
+    parser = argparse.ArgumentParser(description="管理 macOS QQ Bridge LaunchAgent")
     parser.add_argument("action", choices=("install", "restart", "status", "uninstall"))
     parser.add_argument(
         "--transport",
         choices=TRANSPORTS,
-        default="exec",
-        help="Codex transport used by the LaunchAgent (default: exec)",
+        default="auto",
+        help="LaunchAgent 使用的 Codex 传输方式（默认：auto）",
     )
     return parser.parse_args()
 
@@ -389,7 +439,7 @@ def main() -> int:
                 Path(sys.executable).resolve(),
             )
         except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-            print(f"Service operation failed: {exc}", file=sys.stderr)
+            print(f"服务操作失败：{exc}", file=sys.stderr)
             return 1
 
     args = parse_args()
@@ -405,7 +455,7 @@ def main() -> int:
             return uninstall(runtime_dir, plist_path)
         return status()
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-        print(f"Service operation failed: {exc}", file=sys.stderr)
+        print(f"服务操作失败：{exc}", file=sys.stderr)
         return 1
 
 
