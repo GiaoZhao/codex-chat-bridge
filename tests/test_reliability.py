@@ -28,8 +28,6 @@ from chat_channel import (
     Recipient,
     action_rows,
 )
-
-
 THREAD_ID = "00000000-0000-4000-8000-000000000001"
 
 
@@ -790,6 +788,48 @@ class BridgeAcceptanceTests(unittest.TestCase):
                 ),
             )
 
+    def test_steer_targets_only_a_bridge_owned_app_server_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                THREAD_ID,
+                "active task",
+                root,
+            )
+            runner = Mock()
+            runner.transport_name = "app-server"
+            runner.steer_thread.return_value = True
+            service._runner_for_thread = Mock(return_value=runner)
+            service._safe_send = Mock(return_value=True)
+            event = InboundMessage("qq", "user", "message-steer", "/steer 补充目标")
+
+            service._on_channel_event(event)
+
+            runner.steer_thread.assert_called_once_with(THREAD_ID, "补充目标")
+            self.assertIn("已追加", service._safe_send.call_args.args[1])
+
+    def test_cancel_does_not_target_an_untracked_desktop_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                THREAD_ID,
+                "active task",
+                root,
+            )
+            service.runner = Mock()
+            service.runner.transport_name = "app-server"
+            service._runner_for_thread = Mock(return_value=None)
+            service._safe_send = Mock(return_value=True)
+            event = InboundMessage("qq", "user", "message-cancel", "/cancel")
+
+            service._on_channel_event(event)
+
+            self.assertIn("不能跨进程终止", service._safe_send.call_args.args[1])
+
     def test_new_job_skips_source_thread_idle_wait(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -809,7 +849,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
                 "running task",
                 root,
             )
-            service._wait_until_idle = Mock(return_value=False)
             service._cleanup_job_attachments = Mock()
             service._mark_thread_idle = Mock()
             service._refresh_desktop = Mock()
@@ -840,7 +879,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
 
             service._worker_loop()
 
-            service._wait_until_idle.assert_not_called()
             service._run_job.assert_called_once()
             service._mark_thread_idle.assert_called_once_with(new_thread_id)
             service._refresh_desktop.assert_called_once_with(new_thread_id, root)
@@ -921,7 +959,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
                 "running task",
                 root,
             )
-            service._wait_until_idle = Mock()
             service._cleanup_job_attachments = Mock()
             service._mark_thread_idle = Mock()
             service._refresh_desktop = Mock()
@@ -952,7 +989,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
 
             service._worker_loop()
 
-            service._wait_until_idle.assert_not_called()
             service._mark_thread_idle.assert_not_called()
             service._refresh_desktop.assert_not_called()
 
@@ -1105,11 +1141,14 @@ class BridgeAcceptanceTests(unittest.TestCase):
             service._cleanup_job_attachments = Mock()
             service._run_job = Mock()
 
-            def stop_while_waiting(_thread_id: str) -> bool:
-                service.stop_event.set()
-                return True
+            set_job_status = service.store.set_job_status
 
-            service._wait_until_idle = stop_while_waiting
+            def stop_before_dispatch(job_id: str, status: str, **kwargs: object) -> None:
+                set_job_status(job_id, status, **kwargs)
+                if status == "preparing":
+                    service.stop_event.set()
+
+            service.store.set_job_status = Mock(side_effect=stop_before_dispatch)
             payload = {
                 "openid": "user",
                 "action": "resume",
@@ -1145,7 +1184,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
             service.runner.running.return_value = False
             service.active_thread = Mock()
             service.active_thread.snapshot.return_value = ThreadInfo(THREAD_ID, "task", root)
-            service._wait_until_idle = Mock(return_value=True)
             service._cleanup_job_attachments = Mock()
             service._mark_thread_idle = Mock()
             service._refresh_desktop = Mock()
@@ -1213,7 +1251,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
             service.runner.running.return_value = False
             service.active_thread = Mock()
             service.active_thread.snapshot.return_value = ThreadInfo(THREAD_ID, "task", root)
-            service._wait_until_idle = Mock(return_value=True)
             service._cleanup_job_attachments = Mock()
 
             def uncertain_run(*_args: object, **_kwargs: object) -> None:
@@ -1241,6 +1278,146 @@ class BridgeAcceptanceTests(unittest.TestCase):
             self.assertIn("无法确认", notice.payload["text"])
             service._cleanup_job_attachments.assert_called_once()
 
+    def test_run_job_uses_codex_queue_without_resuming_through_app_server(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            service.config.codex_sessions_dir = root
+            service.config.codex_workdir = root
+            service.config.codex_turn_timeout = 60
+            service._on_job_queued_to_codex = Mock()
+            expected = JobRunResult(
+                THREAD_ID,
+                "succeeded",
+                final_message="done",
+                event_id="event-1",
+            )
+            service._wait_for_queued_turn_result = Mock(return_value=expected)
+            runner = Mock()
+            event = {
+                "openid": "user",
+                "action": "resume",
+                "thread_id": THREAD_ID,
+                "workdir": str(root),
+                "content": "来自 QQ 的消息",
+                "image_paths": [],
+            }
+
+            with patch("bridge.queue_codex_message") as queue_message:
+                result = service._run_job(
+                    "job-1",
+                    event,
+                    "resume",
+                    THREAD_ID,
+                    root,
+                    "来自 QQ 的消息",
+                    [],
+                    runner,
+                )
+
+            self.assertEqual(result, expected)
+            queue_message.assert_called_once_with(
+                service.config,
+                THREAD_ID,
+                "来自 QQ 的消息",
+                root,
+                [],
+            )
+            runner.run.assert_not_called()
+            service._on_job_queued_to_codex.assert_called_once_with(
+                "job-1",
+                event,
+                THREAD_ID,
+            )
+
+    def test_wait_for_queued_turn_ignores_an_earlier_unrelated_final(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            service = self._service(root)
+            service.config.codex_sessions_dir = root
+            service.config.codex_turn_timeout = 60
+            session = root / f"rollout-test-{THREAD_ID}.jsonl"
+            session.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "来自 QQ 的消息",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            checkpoint = (session.resolve(), session.stat().st_size)
+            records = [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": "当前消息结果",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "queued-turn",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "来自 QQ 的消息"}
+                        ],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": "queued-turn"
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": "QQ 消息结果",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "other-turn",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "queued-turn",
+                    },
+                },
+            ]
+            with session.open("a", encoding="utf-8") as handle:
+                for record in records:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            result = service._wait_for_queued_turn_result(
+                THREAD_ID,
+                "来自 QQ 的消息",
+                checkpoint,
+                root,
+            )
+
+            self.assertEqual(result.status, "succeeded")
+            self.assertEqual(result.final_message, "QQ 消息结果")
+            self.assertTrue(result.event_id)
+
     def test_worker_requests_shutdown_after_two_terminal_persistence_failures(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -1256,7 +1433,6 @@ class BridgeAcceptanceTests(unittest.TestCase):
             service.runner.running.return_value = False
             service.active_thread = Mock()
             service.active_thread.snapshot.return_value = ThreadInfo(THREAD_ID, "task", root)
-            service._wait_until_idle = Mock(return_value=True)
             service._cleanup_job_attachments = Mock()
             service._run_job = Mock(
                 return_value=JobRunResult(
@@ -1342,7 +1518,7 @@ class BridgeAcceptanceTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 2)
         self.assertTrue(
-            any("storage error" in call.args[1] for call in logged.call_args_list)
+            any("存储错误" in call.args[1] for call in logged.call_args_list)
         )
 
 

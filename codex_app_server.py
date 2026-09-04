@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
@@ -27,6 +28,13 @@ class AppServerUnavailableError(AppServerProtocolError):
     pass
 
 
+@dataclass(frozen=True)
+class AppServerThreadRuntime:
+    status: str
+    active_turn_id: str = ""
+    active_flags: Tuple[str, ...] = ()
+
+
 def _error_text(value: Any) -> str:
     if isinstance(value, dict):
         message = value.get("message")
@@ -34,7 +42,7 @@ def _error_text(value: Any) -> str:
             return message.strip()
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     text = str(value or "").strip()
-    return text or "app-server request failed"
+    return text or "app-server 请求失败"
 
 
 class AppServerRPCClient:
@@ -211,6 +219,78 @@ class AppServerCodexRunner:
         with self._lock:
             return self._termination_reason
 
+    def active_thread_id(self) -> str:
+        with self._lock:
+            return self._active_thread_id
+
+    def thread_runtime(self, thread_id: str) -> AppServerThreadRuntime:
+        client = self._open_client()
+        try:
+            self._initialize(client)
+            result = client.request(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": False},
+            )
+            runtime = self._parse_thread_runtime(
+                result,
+                thread_id,
+                require_active_turn=False,
+            )
+            if runtime.status != "active":
+                return runtime
+            turns_result = client.request(
+                "thread/turns/list",
+                {
+                    "threadId": thread_id,
+                    "limit": 1,
+                    "sortDirection": "desc",
+                    "itemsView": "notLoaded",
+                },
+            )
+            return self._parse_thread_runtime(result, thread_id, turns_result)
+        finally:
+            client.close()
+
+    def steer_thread(
+        self,
+        thread_id: str,
+        prompt: str,
+        image_paths: Optional[List[Path]] = None,
+    ) -> bool:
+        inputs: List[Dict[str, Any]] = []
+        if prompt.strip():
+            inputs.append({"type": "text", "text": prompt.strip()})
+        inputs.extend(
+            {"type": "localImage", "path": str(path.resolve())}
+            for path in image_paths or []
+        )
+        if not inputs:
+            raise ValueError("追加目标不能为空")
+        with self._lock:
+            active_thread_id = self._active_thread_id
+            active_turn_id = self._active_turn_id
+        if active_thread_id != thread_id or not active_turn_id:
+            return False
+        client = self._open_client()
+        try:
+            self._initialize(client)
+            result = client.request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "input": inputs,
+                    "expectedTurnId": active_turn_id,
+                },
+            )
+            accepted_turn_id = (
+                str(result.get("turnId") or "") if isinstance(result, dict) else ""
+            )
+            if accepted_turn_id != active_turn_id:
+                raise AppServerProtocolError("turn/steer 未返回目标活动回合编号")
+            return True
+        finally:
+            client.close()
+
     def run(
         self,
         prompt: str,
@@ -296,7 +376,7 @@ class AppServerCodexRunner:
 
             if "id" in message and method:
                 if on_diagnostic is not None:
-                    on_diagnostic(f"desktop interaction required: {method}")
+                    on_diagnostic(f"需要 Desktop 交互：{method}")
                 return
             if method == "item/completed":
                 item = params.get("item")
@@ -416,7 +496,7 @@ class AppServerCodexRunner:
                 final = final_messages[-1][1]
             if status == "completed":
                 return 0, thread_id, final, ""
-            error = _error_text(completed_turn.get("error") or f"turn status: {status}")
+            error = _error_text(completed_turn.get("error") or f"回合状态：{status}")
             if status == "interrupted":
                 with self._lock:
                     if not self._termination_reason:
@@ -440,6 +520,46 @@ class AppServerCodexRunner:
             )
         finally:
             client.close()
+
+    @staticmethod
+    def _parse_thread_runtime(
+        result: Any,
+        expected_thread_id: str,
+        turns_result: Any = None,
+        *,
+        require_active_turn: bool = True,
+    ) -> AppServerThreadRuntime:
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != expected_thread_id:
+            raise AppServerProtocolError("thread/read 未返回目标任务")
+        raw_status = thread.get("status")
+        status = (
+            str(raw_status.get("type") or "")
+            if isinstance(raw_status, dict)
+            else ""
+        )
+        if status not in {"notLoaded", "idle", "systemError", "active"}:
+            raise AppServerProtocolError("thread/read 返回了未知任务状态")
+        raw_flags = raw_status.get("activeFlags") if isinstance(raw_status, dict) else []
+        active_flags = tuple(
+            str(value)
+            for value in raw_flags or []
+            if isinstance(value, str) and value
+        )
+        active_turn_id = ""
+        turns = thread.get("turns")
+        if isinstance(turns_result, dict):
+            turns = turns_result.get("data")
+        if isinstance(turns, list):
+            for turn in reversed(turns):
+                if not isinstance(turn, dict) or turn.get("status") != "inProgress":
+                    continue
+                active_turn_id = str(turn.get("id") or "")
+                if active_turn_id:
+                    break
+        if require_active_turn and status == "active" and not active_turn_id:
+            raise AppServerProtocolError("活动任务未返回活动回合编号")
+        return AppServerThreadRuntime(status, active_turn_id, active_flags)
 
     def _open_client(self) -> AppServerRPCClient:
         client = self._client_factory()

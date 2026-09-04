@@ -5,7 +5,7 @@
 QQ 发起的任务会经过以下可区分阶段：
 
 1. `已接收并保存`：消息和附件已写入本机持久队列，但 Codex 尚未启动。
-2. `已保存并进入等待队列`：检测到已有 Codex 任务，当前任务继续等待。
+2. `已保存并进入等待队列`：App Server 确认目标任务存在活动回合；消息等待该回合结束。
 3. `Codex 共享回合已启动` 或 `Codex 子进程已启动`：shared daemon 已接受回合，或本机
    已成功创建 Codex CLI 子进程，任务开始执行。
 
@@ -55,23 +55,29 @@ Markdown 优先按段落和完整行切分，不切断内联链接、自动链�
 超过单片限制的代码块也会明确降级为分段文本。达到最大分片数后仍会截断，并提示回
 Codex Desktop 查看完整结果。
 
-当前版本不自动操作 Codex Desktop 页面。macOS 的 `app-server` 传输让 Bridge 和 Desktop
-连接同一个 standalone Codex shared daemon，QQ 回合可通过官方协议事件实时显示，`/new`
-标题通过 `thread/name/set` 显式设置。Bridge 不连接调试端口、不切换页面、不清理缓存、
-不重载 renderer；预留开关即使设为 `1` 也不执行 Desktop 操作。
+当前版本不自动操作 Codex Desktop 页面。已有任务的普通消息直接调用官方 `codex queue`，
+将原 job 的文字和图片写入同一 UUID 的跨进程消息队列，不先读取 shared daemon 状态，也不
+调用 `thread/resume`。提交成功后等待 rollout 中出现该输入所在 turn 的终态，并使用最终记录
+事件 ID 与会话监听通知去重。提交后的中断或等待超时属于不确定状态，不自动重发，避免重复
+执行。`/new` 仍可通过 App Server 创建任务并用 `thread/name/set` 设置标题。
+
+Desktop 的 stdio app-server 与 shared daemon 是不同进程。`thread/read` 返回的是接受请求的
+App Server 自身运行时状态；它的 `idle` 或 `notLoaded` 不能证明 Desktop 回合忙闲。
+`/status` 因此分别报告 Bridge 自身回合、shared daemon 局部状态和本机 writer lock，并注明
+writer lock 也不代表回合忙闲。`/steer` 与 `/cancel` 只使用 runner 自己记录的活动 thread/turn，
+不会跨进程修改或终止 Desktop 回合。
 
 `CODEX_TRANSPORT=auto` 在 control socket 存在且握手返回官方 daemon 身份时选择
 `app-server`，否则选择 `exec`。官方身份当前限定为 `userAgent` 以 `Codex Desktop/` 或
 `codex-cli/` 开头；`codex-chat-bridge/` 会回退 `exec`。严格 `app-server` 模式遇到非官方
-身份、socket 缺失或握手失败时阻止 Bridge 启动。Windows 当前固定使用 `exec`，外部 CLI
-回合虽然写入原生会话，Desktop 当前页面仍可能不会立即更新。
+身份、socket 缺失或握手失败时阻止 Bridge 启动。Windows 尚未完成真机端到端验证，使用前
+必须确认当地 Codex CLI 支持 `codex queue`。
 
-shared daemon 是实验能力。macOS LaunchAgent 默认使用 `exec`，安装和启动时都不执行
-`daemon bootstrap`，避免 Bridge 抢先成为 daemon 客户端身份。只有 Desktop 已建立可验证
-的官方 daemon 且账号策略允许 Bridge app-server 调用时，才使用
-`scripts/macos-service.sh install --transport auto`。若上游返回“只允许官方客户端”，应
-恢复默认 `exec`；Bridge 不伪装官方客户端。审批请求不会由 Bridge 自动同意；QQ 只发送
-提示，实际决定在 Desktop 对应任务完成。
+shared daemon 是实验能力。macOS LaunchAgent 默认使用 `auto`，并在停止旧服务前检查配置的
+CLI 是否支持 `codex queue`。只有显式选择 `--transport app-server` 时才执行官方 daemon 的
+bootstrap/start；这个选择只影响 Bridge 自己创建的回合，不能把 Desktop 的 stdio App Server
+变成同一进程。审批请求不会由 Bridge 自动同意；QQ 只发送提示，实际决定在对应 Codex 任务
+完成。
 
 Bridge 本身应使用 `scripts/macos-service.sh install` 安装为用户 LaunchAgent。不要把
 `scripts/run.sh` 作为 Codex 工具调用或临时 PTY 中的长期前台命令；这类执行会话结束时，
@@ -146,5 +152,5 @@ Compress-Archive -Path .\data\logs\bridge.jsonl* -DestinationPath .\bridge-logs.
 
 在 QQ 中发送 `/status` 可查看 Gateway 状态、worker 阶段、最近任务状态、持久任务数、
 待发送通知数、最近错误和日志位置。`scripts/run.sh --check` 或 Windows 的
-`scripts\run.ps1 --check` 只验证本机配置、依赖、Codex 命令和会话文件，不连接 QQ，也
+`scripts\run.ps1 --check` 只验证本机配置、依赖、Codex 命令、`codex queue` 能力和会话文件，不连接 QQ，也
 不能证明 QQ 凭证和公网连接当前可用。

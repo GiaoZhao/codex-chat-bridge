@@ -93,7 +93,7 @@ class BridgeInstanceLock:
 
 
 class BridgeStore:
-    """Durable job and notification ledger backed by a local SQLite database."""
+    """由本地 SQLite 数据库支持的持久化任务与通知账本。"""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -204,7 +204,7 @@ class BridgeStore:
     def _decode_json(value: str) -> Dict[str, Any]:
         parsed = json.loads(value)
         if not isinstance(parsed, dict):
-            raise ValueError("stored payload is not a JSON object")
+            raise ValueError("已保存的任务内容不是 JSON 对象")
         return parsed
 
     @classmethod
@@ -256,7 +256,7 @@ class BridgeStore:
             )
             if active >= max_active:
                 connection.rollback()
-                raise OverflowError("job queue is full")
+                raise OverflowError("任务队列已满")
             job_id = uuid.uuid4().hex
             connection.execute(
                 """
@@ -271,7 +271,7 @@ class BridgeStore:
             ).fetchone()
             connection.commit()
         if row is None:
-            raise RuntimeError("failed to read persisted job")
+            raise RuntimeError("无法读取已持久化的任务")
         return self._job_from_row(row), True
 
     def claim_job(self, job_id: str) -> Optional[StoredJob]:
@@ -328,7 +328,7 @@ class BridgeStore:
                 (status, now, started_at, finished_at, process_id, error, job_id),
             )
             if cursor.rowcount != 1:
-                raise KeyError(f"unknown job: {job_id}")
+                raise KeyError(f"未知任务：{job_id}")
 
     def set_job_status_with_outbox(
         self,
@@ -363,7 +363,7 @@ class BridgeStore:
                 (status, now, started_at, finished_at, process_id, error, job_id),
             )
             if cursor.rowcount != 1:
-                raise KeyError(f"unknown job: {job_id}")
+                raise KeyError(f"未知任务：{job_id}")
             self._insert_outbox_specs(connection, items, now)
             connection.commit()
 

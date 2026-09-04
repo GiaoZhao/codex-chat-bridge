@@ -1,4 +1,4 @@
-# Desktop Client Requirements
+# Desktop 客户端需求
 
 状态：已确认的产品需求基线
 

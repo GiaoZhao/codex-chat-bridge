@@ -412,7 +412,7 @@ class QQGatewayClient:
             try:
                 self.on_state(state, detail)
             except Exception as exc:
-                log_event("qq-gateway", f"state callback failed: {exc}", level="ERROR")
+                log_event("qq-gateway", f"状态回调失败：{exc}", level="ERROR")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -427,7 +427,7 @@ class QQGatewayClient:
             try:
                 self._emit_state("connecting")
                 url = self.api.gateway_url()
-                log_event("qq-gateway", "connecting")
+                log_event("qq-gateway", "正在连接")
                 self.ws = websocket.WebSocketApp(
                     url,
                     on_message=self._on_message,
@@ -439,7 +439,7 @@ class QQGatewayClient:
                 log_event("qq-gateway", str(exc), level="ERROR")
                 self._emit_state("error", str(exc))
             if not self.stop_event.wait(5):
-                log_event("qq-gateway", "reconnecting")
+                log_event("qq-gateway", "正在重连")
 
     def _send(self, payload: Dict[str, Any]) -> None:
         with self._send_lock:
@@ -521,7 +521,7 @@ class QQGatewayClient:
             if event_type == "READY":
                 data = payload.get("d") or {}
                 self.session_id = str(data.get("session_id") or "")
-                log_event("qq-gateway", "READY")
+                log_event("qq-gateway", "连接已就绪（READY）")
                 self._emit_state("ready")
                 self.on_ready()
                 return
@@ -529,14 +529,14 @@ class QQGatewayClient:
             if event and self._dedup(event["message_id"]):
                 self.on_event(event)
         except Exception as exc:
-            log_event("qq-gateway", f"event error: {exc}", level="ERROR")
+            log_event("qq-gateway", f"事件处理失败：{exc}", level="ERROR")
 
     def _on_error(self, _ws: Any, error: Any) -> None:
-        log_event("qq-gateway", f"websocket error: {error}", level="ERROR")
+        log_event("qq-gateway", f"WebSocket 错误：{error}", level="ERROR")
         self._emit_state("error", str(error))
 
     def _on_close(self, _ws: Any, code: Any, reason: Any) -> None:
         self._stop_heartbeat()
-        log_event("qq-gateway", f"closed code={code} reason={reason}")
+        log_event("qq-gateway", f"连接已关闭：状态码={code}，原因={reason}")
         if not self.stop_event.is_set():
-            self._emit_state("disconnected", f"code={code} reason={reason}")
+            self._emit_state("disconnected", f"状态码={code}，原因={reason}")

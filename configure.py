@@ -59,9 +59,9 @@ end run
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Configure chat adapters for Codex Chat Bridge"
+        description="配置 Codex Chat Bridge 聊天渠道"
     )
-    parser.add_argument("--gui", action="store_true", help="use secure macOS dialogs")
+    parser.add_argument("--gui", action="store_true", help="使用安全的 macOS 对话框")
     args = parser.parse_args()
     if args.gui and sys.platform != "darwin":
         print("配置错误：--gui 仅支持 macOS；请移除 --gui 使用终端配置。", file=sys.stderr)
@@ -78,7 +78,7 @@ def main() -> int:
 
     ask_value = gui_ask if args.gui else ask
     raw_channels = require_single_line(
-        "Bridge channels",
+        "Bridge 渠道",
         ask_value("启用渠道，逗号分隔（qq,dingtalk）", DEFAULT_CHANNELS),
     )
     channels = tuple(
@@ -114,10 +114,10 @@ def main() -> int:
             ask_value("钉钉应用 Client Secret（AppSecret）", secret=True),
         )
     thread_id = require_single_line(
-        "Codex Thread ID", ask_value("Codex Thread ID", DEFAULT_THREAD_ID)
+        "Codex 任务 ID", ask_value("Codex 任务 ID", DEFAULT_THREAD_ID)
     )
     workdir = require_single_line(
-        "Codex Workdir", ask_value("Codex 工作目录", DEFAULT_WORKDIR)
+        "Codex 工作目录", ask_value("Codex 工作目录", DEFAULT_WORKDIR)
     )
     command = shutil.which("codex") or "codex"
     qq_bind_code = "".join(secrets.choice("0123456789") for _ in range(8))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import sqlite3
 import tempfile
 import threading
@@ -14,6 +16,7 @@ from bridge_core import (
     ActiveThread,
     CodexDesktopRefresher,
     CodexRunner,
+    codex_writer_lock_held,
     SessionMonitor,
     StateStore,
     ThreadIndex,
@@ -29,6 +32,10 @@ from bridge_core import (
     split_message,
     summarize_codex_error,
 )
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on Windows
+    fcntl = None  # type: ignore
 from bridge import BridgeService
 from chat_channel import ChannelLimits, ChannelRegistry, Recipient
 from qq_gateway import QQApi, clean_message_content, download_c2c_images, extract_c2c_event
@@ -57,6 +64,33 @@ class SessionTests(unittest.TestCase):
         }
         self.assertIsNone(final_message_from_record(record))
 
+    def test_response_item_final_message_record(self) -> None:
+        record = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [
+                    {"type": "output_text", "text": "first "},
+                    {"type": "output_text", "text": "answer"},
+                ],
+            },
+        }
+        self.assertEqual(final_message_from_record(record), "first answer")
+
+    def test_response_item_commentary_is_not_final(self) -> None:
+        record = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "working"}],
+            },
+        }
+        self.assertIsNone(final_message_from_record(record))
+
     def test_session_state_and_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
@@ -78,7 +112,6 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(find_session_file(root, "abc"), path)
             self.assertFalse(session_busy(path))
             self.assertEqual(latest_final_message(path), "result")
-
     def test_latest_complete_turn_ignores_incomplete_and_non_final_messages(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             path = Path(raw_dir) / "session.jsonl"
@@ -137,6 +170,46 @@ class SessionTests(unittest.TestCase):
                 latest_complete_turn(path),
                 ("unfinished question", "finished answer"),
             )
+
+    def test_latest_complete_turn_supports_response_items(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "session.jsonl"
+            turn_id = "00000000-0000-4000-8000-000000000001"
+            rows = [
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "injected context"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "actual question"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "actual answer"}],
+                    },
+                },
+            ]
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            self.assertEqual(latest_final_message(path), "actual answer")
+            self.assertEqual(latest_complete_turn(path), ("actual question", "actual answer"))
 
     def test_codex_jsonl_final(self) -> None:
         output = "\n".join(
@@ -202,6 +275,57 @@ class SessionTests(unittest.TestCase):
                 time.sleep(0.02)
             monitor.stop()
             self.assertEqual(received, [(thread_id, "new result")])
+
+    def test_monitor_deduplicates_final_formats_in_one_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            turn_id = "00000000-0000-4000-8000-000000000002"
+            path = root / f"rollout-now-{thread_id}.jsonl"
+            path.write_text("", encoding="utf-8")
+            received = []
+            config = SimpleNamespace(codex_sessions_dir=root, codex_thread_id=thread_id)
+            monitor = SessionMonitor(
+                config,
+                StateStore(root / "state.json"),
+                lambda info, message: received.append((info.thread_id, message)),
+                poll_seconds=0.02,
+            )
+            monitor.start()
+            time.sleep(0.08)
+            rows = [
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "task_started", "turn_id": turn_id},
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": "same answer",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "same answer"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                    },
+                },
+            ]
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("".join(json.dumps(row) + "\n" for row in rows))
+            deadline = time.time() + 2
+            while not received and time.time() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.08)
+            monitor.stop()
+
+            self.assertEqual(received, [(thread_id, "same answer")])
 
     def test_monitor_reads_new_finals_from_all_visible_threads(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -458,6 +582,90 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(callback.call_args.args[1], "current answer")
             self.assertEqual(callback.call_args.args[3], "current question")
 
+    def test_response_final_event_includes_the_last_response_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            turn_id = "00000000-0000-4000-8000-000000000002"
+            path = root / f"rollout-now-{thread_id}.jsonl"
+            user_records = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "injected context"}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "actual question"}],
+                    },
+                },
+            ]
+            path.write_text(
+                "".join(json.dumps(record) + "\n" for record in user_records),
+                encoding="utf-8",
+            )
+            final_offset = path.stat().st_size
+            final_record = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "actual answer"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                },
+            }
+            callback = Mock()
+            config = SimpleNamespace(codex_sessions_dir=root, codex_thread_id=thread_id)
+            monitor = SessionMonitor(
+                config,
+                StateStore(root / "state.json"),
+                Mock(),
+                on_final_event=callback,
+            )
+            info = ThreadInfo(thread_id, "task", root, rollout_path=path)
+
+            monitor._handle_record(info, final_record, path, final_offset)
+
+            self.assertEqual(callback.call_args.args[1], "actual answer")
+            self.assertEqual(callback.call_args.args[3], "actual question")
+
+
+class WriterLockTests(unittest.TestCase):
+    @unittest.skipIf(fcntl is None, "writer locks are unavailable on Windows")
+    def test_detects_another_process_holding_thread_writer_lock(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000001"
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            lock_path = root / "thread-writer-locks" / f"{thread_id}.lock"
+            lock_path.parent.mkdir()
+            lock_path.touch()
+            descriptor = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(codex_writer_lock_held(thread_id, root))
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertFalse(codex_writer_lock_held(thread_id, root))
+
+    def test_missing_or_invalid_writer_lock_is_not_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            self.assertFalse(
+                codex_writer_lock_held(
+                    "00000000-0000-4000-8000-000000000001",
+                    root,
+                )
+            )
+            self.assertFalse(codex_writer_lock_held("not-a-thread", root))
+
 
 class ThreadIndexTests(unittest.TestCase):
     def _create_index(self, root: Path) -> ThreadIndex:
@@ -598,7 +806,7 @@ class ThreadIndexTests(unittest.TestCase):
             index = self._create_index(Path(raw_dir))
 
             self.assertEqual(index.search_page("%"), ([], 0))
-            self.assertEqual(index.search_page("_"), ([], 0))
+            self.assertEqual(index.search_page("newer_task"), ([], 0))
 
     def test_search_results_are_paginated_by_recency(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -763,7 +971,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(
             refresher.last_detail,
-            "automatic Desktop sync unavailable: no non-destructive Desktop API",
+            "Desktop 自动同步不可用：当前没有无损 Desktop API",
         )
 
     def test_desktop_refresh_respects_disabled_setting(self) -> None:
@@ -772,7 +980,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(
             refresher.refresh("00000000-0000-4000-8000-000000000001")
         )
-        self.assertEqual(refresher.last_detail, "disabled")
+        self.assertEqual(refresher.last_detail, "已禁用")
 
     def test_error_summary_removes_unrelated_plugin_warnings(self) -> None:
         stderr = "\n".join(
@@ -910,7 +1118,7 @@ class BridgeServiceTests(unittest.TestCase):
             self.assertIn("已切换", text)
             self.assertIn("finished task", text)
 
-    def test_rejects_switch_when_target_thread_is_running(self) -> None:
+    def test_switches_when_target_thread_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
             root = Path(raw_dir)
             current = ThreadInfo(
@@ -951,8 +1159,9 @@ class BridgeServiceTests(unittest.TestCase):
 
             text = service._switch_thread(target.thread_id)
 
-            service.active_thread.switch.assert_not_called()
-            self.assertEqual(text, "目标任务仍在执行，结束后才能切换。")
+            service.active_thread.switch.assert_called_once_with(target)
+            self.assertIn("已切换", text)
+            self.assertIn("running task", text)
 
     def test_all_thread_notification_uses_origin_thread_context(self) -> None:
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -1030,6 +1239,30 @@ class BridgeServiceTests(unittest.TestCase):
             stored = service.state.load()
             self.assertEqual(stored["known_idle_session_path"], str(completed_path))
 
+    def test_idle_checkpoints_are_preserved_for_multiple_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            first_id = "00000000-0000-4000-8000-000000000001"
+            second_id = "00000000-0000-4000-8000-000000000002"
+            first_path = root / f"rollout-first-{first_id}.jsonl"
+            second_path = root / f"rollout-second-{second_id}.jsonl"
+            self._write_session(first_path, "task_started", "task_complete")
+            self._write_session(second_path, "task_started", "task_complete")
+            service = BridgeService.__new__(BridgeService)
+            service.config = SimpleNamespace(codex_sessions_dir=root)
+            service.state = StateStore(root / "state.json")
+            service.monitor = Mock()
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(first_id, "first", root)
+            service._idle_checkpoint_lock = threading.Lock()
+
+            service._mark_thread_idle(first_id)
+            service._mark_thread_idle(second_id)
+
+            checkpoints = service.state.load()["known_idle_sessions"]
+            self.assertEqual(checkpoints[str(first_path)], first_path.stat().st_size)
+            self.assertEqual(checkpoints[str(second_path)], second_path.stat().st_size)
+
     def test_first_stop_waits_and_second_stop_cancels(self) -> None:
         service = BridgeService.__new__(BridgeService)
         service._stop_started = threading.Event()
@@ -1049,6 +1282,349 @@ class BridgeServiceTests(unittest.TestCase):
 
         service.stop()
         self.assertEqual(service.runner.cancel_count, 1)
+
+    def test_cancel_targets_only_selected_running_thread(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        selected = MockRunner()
+        other = MockRunner()
+        service._task_worker_lock = threading.Lock()
+        service._active_runners = {"selected": selected, "other": other}
+        service._runner_threads = {}
+
+        runner = service._runner_for_thread("selected")
+        cancelled = runner.cancel() if runner is not None else False
+
+        self.assertTrue(cancelled)
+        self.assertEqual(selected.cancel_count, 1)
+        self.assertEqual(other.cancel_count, 0)
+
+    def test_second_stop_cancels_all_parallel_runners(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        first = MockRunner()
+        second = MockRunner()
+        service._stop_started = threading.Event()
+        service._stop_started.set()
+        service._stop_complete = threading.Event()
+        service._stop_complete.set()
+        service._stop_state_lock = threading.Lock()
+        service._task_worker_lock = threading.Lock()
+        service._active_runners = {"first": first, "second": second}
+
+        service.stop()
+
+        self.assertEqual(first.cancel_count, 1)
+        self.assertEqual(second.cancel_count, 1)
+
+    def test_resume_dispatch_does_not_wait_for_the_desktop_writer_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            job = SimpleNamespace(
+                job_id="job-locked",
+                payload={
+                    "action": "resume",
+                    "thread_id": thread_id,
+                    "workdir": str(root),
+                    "content": "来自 QQ 的消息",
+                    "channel": "qq",
+                    "recipient_id": "user",
+                },
+                status="preparing",
+            )
+            service = BridgeService.__new__(BridgeService)
+            service.stop_event = threading.Event()
+            service._runtime_lock = threading.Lock()
+            service._worker_context = threading.local()
+            service._worker_states = {}
+            service._busy_worker_count = 0
+            service.worker_busy = threading.Event()
+            service.config = SimpleNamespace(
+                codex_sessions_dir=root,
+                codex_workdir=root,
+            )
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                thread_id,
+                "desktop task",
+                root,
+            )
+            service.store = Mock()
+            service.store.claim_job.return_value = job
+            service._recipient_from_payload = Mock(
+                return_value=Recipient("qq", "user")
+            )
+            service._safe_send = Mock()
+            service._run_job = Mock(
+                return_value=SimpleNamespace(
+                    thread_id="00000000-0000-4000-8000-000000000002",
+                    status="succeeded",
+                    error="",
+                )
+            )
+            service._persist_job_result_with_retry = Mock(return_value=True)
+            service._mark_thread_idle = Mock()
+            service._refresh_desktop = Mock()
+            service._cleanup_job_attachments = Mock()
+            runner = Mock()
+            runner.running.return_value = False
+            jobs = queue.Queue()
+            jobs.put("job-locked")
+
+            with patch(
+                "bridge.codex_writer_lock_held", return_value=True
+            ) as lock_probe:
+                service._worker_loop(
+                    job_queue=jobs,
+                    runner=runner,
+                    lane_key=thread_id,
+                    exit_when_empty=True,
+                )
+
+            self.assertEqual(job.payload["action"], "resume")
+            service._run_job.assert_called_once()
+            self.assertEqual(service._run_job.call_args.args[2], "resume")
+            lock_probe.assert_not_called()
+            waiting_calls = [
+                call
+                for call in service.store.set_job_status.call_args_list
+                if len(call.args) > 1 and call.args[1] == "waiting"
+            ]
+            self.assertEqual(waiting_calls, [])
+            service._safe_send.assert_not_called()
+
+    def test_resume_dispatch_does_not_query_shared_daemon_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            thread_id = "00000000-0000-4000-8000-000000000001"
+            job = SimpleNamespace(
+                job_id="job-idle",
+                payload={
+                    "action": "resume",
+                    "thread_id": thread_id,
+                    "workdir": str(root),
+                    "content": "来自 QQ 的消息",
+                    "channel": "qq",
+                    "recipient_id": "user",
+                },
+                status="preparing",
+            )
+            service = BridgeService.__new__(BridgeService)
+            service.stop_event = threading.Event()
+            service._runtime_lock = threading.Lock()
+            service._worker_context = threading.local()
+            service._worker_states = {}
+            service._busy_worker_count = 0
+            service.worker_busy = threading.Event()
+            service.config = SimpleNamespace(
+                codex_sessions_dir=root,
+                codex_workdir=root,
+            )
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = ThreadInfo(
+                thread_id,
+                "desktop task",
+                root,
+            )
+            service.store = Mock()
+            service.store.claim_job.return_value = job
+            service._recipient_from_payload = Mock(
+                return_value=Recipient("qq", "user")
+            )
+            service._safe_send = Mock()
+            service._run_job = Mock(
+                return_value=SimpleNamespace(
+                    thread_id=thread_id,
+                    status="succeeded",
+                    error="",
+                )
+            )
+            service._persist_job_result_with_retry = Mock(return_value=True)
+            service._mark_thread_idle = Mock()
+            service._refresh_desktop = Mock()
+            service._cleanup_job_attachments = Mock()
+            runner = Mock()
+            runner.transport_name = "app-server"
+            runner.thread_runtime.return_value = SimpleNamespace(
+                status="idle",
+                active_flags=(),
+            )
+            jobs = queue.Queue()
+            jobs.put("job-idle")
+
+            with patch("bridge.codex_writer_lock_held", return_value=True) as lock_probe:
+                service._worker_loop(
+                    job_queue=jobs,
+                    runner=runner,
+                    lane_key=thread_id,
+                    exit_when_empty=True,
+                )
+
+            lock_probe.assert_not_called()
+            runner.thread_runtime.assert_not_called()
+            service._run_job.assert_called_once()
+            service._safe_send.assert_not_called()
+
+    def test_new_app_server_thread_is_registered_while_running(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        runner = MockRunner()
+        runner.active_thread_id = Mock(return_value="created-thread")
+        service._task_worker_lock = threading.Lock()
+        service._active_runners = {"new:job": runner}
+        service._runner_threads = {}
+        service._worker_context = threading.local()
+        service._worker_context.lane_key = "new:job"
+        service._set_job_status_with_notification = Mock()
+        service._set_worker_state = Mock()
+
+        service._on_job_started(
+            "job",
+            {"channel": "qq", "recipient_id": "user", "thread_id": "source"},
+            "new",
+            None,
+            runner,
+        )
+
+        self.assertEqual(service._runner_threads["new:job"], "created-thread")
+
+    def test_dispatch_starts_different_thread_lanes_in_parallel(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        service._task_worker_lock = threading.Lock()
+        service._task_queues = {}
+        service._task_workers = {}
+        service._runner_threads = {}
+        payloads = {
+            "job-a": {"action": "resume", "thread_id": "thread-a"},
+            "job-b": {"action": "resume", "thread_id": "thread-b"},
+        }
+        service.store = Mock()
+        service.store.get_job.side_effect = lambda job_id: SimpleNamespace(
+            status="queued",
+            payload=payloads[job_id],
+        )
+        started: "queue.Queue[str]" = queue.Queue()
+        release = threading.Event()
+
+        def hold_lane(lane_key: str, _task_queue: object) -> None:
+            started.put(lane_key)
+            release.wait(2)
+
+        service._task_worker_loop = hold_lane
+        service._dispatch_job("job-a")
+        service._dispatch_job("job-b")
+        lanes = {started.get(timeout=1), started.get(timeout=1)}
+
+        self.assertEqual(lanes, {"thread-a", "thread-b"})
+        self.assertEqual(len(service._task_workers), 2)
+        release.set()
+        for worker in service._task_workers.values():
+            worker.join(1)
+
+    def test_dispatch_serializes_jobs_for_the_same_thread(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        service._task_worker_lock = threading.Lock()
+        service._task_queues = {}
+        service._task_workers = {}
+        service._runner_threads = {}
+        service.store = Mock()
+        service.store.get_job.return_value = SimpleNamespace(
+            status="queued",
+            payload={"action": "resume", "thread_id": "thread-a"},
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def hold_lane(_lane_key: str, _task_queue: object) -> None:
+            started.set()
+            release.wait(2)
+
+        service._task_worker_loop = hold_lane
+        service._dispatch_job("job-a")
+        self.assertTrue(started.wait(1))
+        service._dispatch_job("job-b")
+
+        self.assertEqual(len(service._task_workers), 1)
+        self.assertEqual(service._task_queues["thread-a"].qsize(), 2)
+        release.set()
+        service._task_workers["thread-a"].join(1)
+
+    def test_dispatch_routes_created_thread_back_to_its_new_lane(self) -> None:
+        service = BridgeService.__new__(BridgeService)
+        existing_queue: "queue.Queue[str]" = queue.Queue()
+        existing_worker = Mock()
+        existing_worker.is_alive.return_value = True
+        service._task_worker_lock = threading.Lock()
+        service._task_queues = {"new:job-new": existing_queue}
+        service._task_workers = {"new:job-new": existing_worker}
+        service._runner_threads = {"new:job-new": "created-thread"}
+        service.store = Mock()
+        service.store.get_job.return_value = SimpleNamespace(
+            status="queued",
+            payload={"action": "resume", "thread_id": "created-thread"},
+        )
+
+        service._dispatch_job("job-follow-up")
+
+        self.assertEqual(existing_queue.get_nowait(), "job-follow-up")
+        self.assertEqual(list(service._task_workers), ["new:job-new"])
+
+    def test_status_reports_selected_thread_and_parallel_runner_count(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_dir:
+            root = Path(raw_dir)
+            active = ThreadInfo("thread-a", "selected task", root)
+            service = BridgeService.__new__(BridgeService)
+            service.config = SimpleNamespace(
+                codex_sessions_dir=root,
+                base_dir=root,
+            )
+            service.active_thread = Mock()
+            service.active_thread.snapshot.return_value = active
+            service.store = Mock()
+            service.store.active_job_count.return_value = 2
+            service.store.pending_outbox_count.return_value = 0
+            service.store.latest_job.return_value = SimpleNamespace(status="running")
+            service._runtime_lock = threading.Lock()
+            service.channel_states = {"qq": "ready"}
+            service._worker_states = {
+                "thread-a": {"stage": "running"},
+                "thread-b": {"stage": "running"},
+            }
+            service.worker_stage = "running"
+            service.last_worker_error = ""
+            service.channels = SimpleNamespace(names=lambda: ("qq",))
+            service.runner = SimpleNamespace(transport_name="app-server")
+            service.runner.thread_runtime = Mock(
+                return_value=SimpleNamespace(
+                    status="active",
+                    active_flags=(),
+                )
+            )
+            service._task_worker_lock = threading.Lock()
+            service._active_runners = {
+                "thread-a": MockRunner(),
+                "thread-b": MockRunner(),
+            }
+            service._runner_threads = {}
+
+            with patch("bridge.codex_writer_lock_held", return_value=True):
+                text = service._status_text()
+
+            self.assertIn("Bridge 当前任务：执行中", text)
+            self.assertIn("共享 App Server：active", text)
+            self.assertIn("本机 writer 锁：已占用（不代表回合忙闲）", text)
+            self.assertIn("Bridge 运行回合：2", text)
+            self.assertIn("传输：app-server", text)
+
+            service.runner.thread_runtime.return_value = SimpleNamespace(
+                status="notLoaded",
+                active_flags=(),
+            )
+            with patch("bridge.codex_writer_lock_held", return_value=True):
+                not_loaded_text = service._status_text()
+            self.assertIn(
+                "共享 App Server：notLoaded（未由该 daemon 加载）",
+                not_loaded_text,
+            )
+            self.assertNotIn("空闲（未加载）", not_loaded_text)
 
 
 class MockRunner:

@@ -9,4 +9,4 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 "${BASE_DIR}/.venv/bin/python" -m pip install --upgrade pip
 "${BASE_DIR}/.venv/bin/python" -m pip install -r "${BASE_DIR}/requirements.txt"
 
-echo "Dependencies installed in ${BASE_DIR}/.venv"
+echo "依赖已安装到 ${BASE_DIR}/.venv"

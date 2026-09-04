@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import errno
 import ntpath
 import nturl2path
 import os
@@ -17,11 +18,48 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - unavailable on Windows
+    fcntl = None  # type: ignore
+
 
 THREAD_ID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+
+
+def codex_writer_lock_held(
+    thread_id: str,
+    codex_home: Optional[Path] = None,
+) -> bool:
+    """返回是否有其他进程持有 Codex 任务写入锁。"""
+    if fcntl is None or not THREAD_ID_RE.fullmatch(str(thread_id)):
+        return False
+    root = (codex_home or (Path.home() / ".codex")).expanduser()
+    lock_path = root / "thread-writer-locks" / f"{thread_id}.lock"
+    if not lock_path.is_file():
+        return False
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        # 锁探测失败不能阻断正常的 Codex 执行路径。
+        return False
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            if getattr(exc, "errno", None) in {errno.EAGAIN, errno.EACCES}:
+                return True
+            return False
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(descriptor)
 
 
 _LOG_LOCK = threading.Lock()
@@ -84,7 +122,7 @@ def log_event(component: str, message: str, level: str = "INFO") -> None:
                 handle.write(record + "\n")
             os.chmod(path, 0o600)
         except OSError:
-            # Logging must never terminate the Bridge; stdout remains available.
+            # 日志写入失败不能终止 Bridge，标准输出仍可作为兜底。
             return
 
 
@@ -405,7 +443,7 @@ class ThreadInfo:
 
 
 class ThreadIndex:
-    """Read the Codex task index without writing to the Codex database."""
+    """以只读方式读取 Codex 任务索引，不写入 Codex 数据库。"""
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -650,16 +688,68 @@ def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
         return
 
 
-def final_message_from_record(record: Dict[str, Any]) -> Optional[str]:
-    if record.get("type") != "event_msg":
+def _response_message_text(payload: Dict[str, Any], content_type: str) -> Optional[str]:
+    content = payload.get("content")
+    if not isinstance(content, list):
         return None
+    parts = [
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == content_type
+    ]
+    message = "".join(parts).strip()
+    return message or None
+
+
+def final_message_from_record(record: Dict[str, Any]) -> Optional[str]:
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return None
-    if payload.get("type") != "agent_message" or payload.get("phase") != "final_answer":
+    if record.get("type") == "event_msg":
+        if payload.get("type") != "agent_message" or payload.get("phase") != "final_answer":
+            return None
+        message = payload.get("message")
+        return message.strip() if isinstance(message, str) and message.strip() else None
+    if (
+        record.get("type") != "response_item"
+        or payload.get("type") != "message"
+        or payload.get("role") != "assistant"
+        or payload.get("phase") != "final_answer"
+    ):
         return None
-    message = payload.get("message")
-    return message.strip() if isinstance(message, str) and message.strip() else None
+    return _response_message_text(payload, "output_text")
+
+
+def user_message_from_record(record: Dict[str, Any]) -> Optional[str]:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if record.get("type") == "event_msg":
+        if payload.get("type") != "user_message":
+            return None
+        message = payload.get("message")
+        return message.strip() if isinstance(message, str) and message.strip() else None
+    if (
+        record.get("type") != "response_item"
+        or payload.get("type") != "message"
+        or payload.get("role") != "user"
+    ):
+        return None
+    return _response_message_text(payload, "input_text")
+
+
+def record_turn_id(record: Dict[str, Any]) -> str:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    direct = payload.get("turn_id")
+    if isinstance(direct, str) and direct:
+        return direct
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        return ""
+    nested = metadata.get("turn_id")
+    return nested if isinstance(nested, str) else ""
 
 
 def session_busy(path: Path) -> bool:
@@ -688,27 +778,39 @@ def latest_final_message(path: Path) -> Optional[str]:
 
 
 def latest_complete_turn(path: Path) -> Optional[Tuple[str, str]]:
-    current_user: Optional[str] = None
+    event_user: Optional[str] = None
+    response_user: Optional[str] = None
     latest: Optional[Tuple[str, str]] = None
     for record in iter_jsonl(path):
-        if record.get("type") != "event_msg":
-            continue
         payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("type") == "user_message":
-            message = payload.get("message")
-            current_user = message.strip() if isinstance(message, str) and message.strip() else None
+        if (
+            record.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_started"
+        ):
+            event_user = None
+            response_user = None
+        user_message = user_message_from_record(record)
+        if user_message:
+            if record.get("type") == "event_msg":
+                event_user = user_message
+            else:
+                response_user = user_message
             continue
         assistant = final_message_from_record(record)
-        if current_user and assistant:
-            latest = (current_user, assistant)
+        if assistant:
+            current_user = event_user or response_user
+            if current_user:
+                latest = (current_user, assistant)
+            event_user = None
+            response_user = None
     return latest
 
 
 def user_message_before_offset(path: Path, end_offset: int) -> str:
-    """Return the latest user message before one rollout record offset."""
-    latest = ""
+    """返回会话记录指定偏移量之前的最后一条用户消息。"""
+    event_user = ""
+    response_user = ""
     try:
         with path.open("rb") as handle:
             while handle.tell() < end_offset:
@@ -720,19 +822,29 @@ def user_message_before_offset(path: Path, end_offset: int) -> str:
                     record = json.loads(line)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                payload = (
-                    record.get("payload")
-                    if isinstance(record, dict) and record.get("type") == "event_msg"
-                    else None
-                )
-                if not isinstance(payload, dict) or payload.get("type") != "user_message":
+                if not isinstance(record, dict):
                     continue
-                message = payload.get("message")
-                if isinstance(message, str) and message.strip():
-                    latest = message.strip()
+                payload = record.get("payload")
+                if (
+                    record.get("type") == "event_msg"
+                    and isinstance(payload, dict)
+                    and payload.get("type") == "task_started"
+                ):
+                    event_user = ""
+                    response_user = ""
+                if final_message_from_record(record):
+                    event_user = ""
+                    response_user = ""
+                    continue
+                message = user_message_from_record(record)
+                if message:
+                    if record.get("type") == "event_msg":
+                        event_user = message
+                    else:
+                        response_user = message
     except OSError:
         return ""
-    return latest
+    return event_user or response_user
 
 
 def session_record_event_id(path: Path, offset: int, record: Dict[str, Any]) -> str:
@@ -743,7 +855,7 @@ def session_record_event_id(path: Path, offset: int, record: Dict[str, Any]) -> 
 
 
 def complete_jsonl_offset(path: Path) -> int:
-    """Return the byte offset immediately after the last complete JSONL line."""
+    """返回最后一条完整 JSONL 记录后的字节偏移量。"""
     size = path.stat().st_size
     if size == 0:
         return 0
@@ -786,6 +898,8 @@ class SessionMonitor:
         self._paths: Dict[str, Path] = {}
         self._offsets: Dict[str, int] = {}
         self._infos: Dict[str, ThreadInfo] = {}
+        self._active_turn_ids: Dict[str, str] = {}
+        self._last_notified_turn_ids: Dict[str, str] = {}
         stored = self.state.load()
         raw_offsets = stored.get("session_offsets")
         self._saved_offsets = raw_offsets if isinstance(raw_offsets, dict) else {}
@@ -914,6 +1028,9 @@ class SessionMonitor:
     ) -> None:
         payload = record.get("payload") if record.get("type") == "event_msg" else None
         event_id = self._record_event_id(path, offset, record)
+        turn_id = record_turn_id(record)
+        if isinstance(payload, dict) and payload.get("type") == "task_started":
+            self._active_turn_ids[info.thread_id] = turn_id
         if isinstance(payload, dict) and info.thread_id == self.thread_provider():
             event_type = payload.get("type")
             if event_type == "task_started":
@@ -930,6 +1047,14 @@ class SessionMonitor:
             self.on_interrupted(info, detail, event_id)
         message = final_message_from_record(record)
         if message:
+            final_turn_id = turn_id or self._active_turn_ids.get(info.thread_id, "")
+            if (
+                final_turn_id
+                and self._last_notified_turn_ids.get(info.thread_id) == final_turn_id
+            ):
+                return
+            if final_turn_id:
+                self._last_notified_turn_ids[info.thread_id] = final_turn_id
             if self.on_final_event is not None:
                 self.on_final_event(
                     info,
@@ -1053,6 +1178,87 @@ def summarize_codex_error(stderr: str, max_chars: int = 1000) -> str:
     return text[-max_chars:]
 
 
+class CodexQueueError(RuntimeError):
+    pass
+
+
+class CodexQueueDispatchUncertainError(CodexQueueError):
+    pass
+
+
+def _configured_codex_command(config: Any) -> List[str]:
+    raw_command = getattr(config, "codex_command", ())
+    if isinstance(raw_command, str):
+        command = [raw_command]
+    else:
+        command = [str(part) for part in raw_command]
+    if not command or not command[0]:
+        raise CodexQueueError("CODEX_COMMAND 为空，无法调用 codex queue")
+    return command
+
+
+def verify_codex_queue_support(config: Any, workdir: Optional[Path] = None) -> None:
+    command = _configured_codex_command(config)
+    selected_workdir = workdir or getattr(config, "codex_workdir", None)
+    try:
+        completed = subprocess.run(
+            [*command, "queue", "--help"],
+            cwd=str(Path(selected_workdir).resolve()) if selected_workdir else None,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodexQueueError(f"无法检查 codex queue: {exc}") from exc
+    if completed.returncode != 0:
+        detail = summarize_codex_error(completed.stderr or completed.stdout)
+        raise CodexQueueError(
+            f"当前 Codex CLI 不支持可靠的跨进程消息队列: {detail}"
+        )
+
+
+def queue_codex_message(
+    config: Any,
+    thread_id: str,
+    prompt: str,
+    workdir: Path,
+    image_paths: Optional[List[Path]] = None,
+) -> str:
+    command = _configured_codex_command(config)
+    arguments = [
+        *command,
+        "queue",
+        "--thread",
+        thread_id,
+        "--message",
+        prompt,
+    ]
+    for path in image_paths or []:
+        arguments.extend(["-i", str(path.resolve())])
+    try:
+        completed = subprocess.run(
+            arguments,
+            cwd=str(workdir.resolve()),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CodexQueueDispatchUncertainError(
+            "codex queue 超时，无法确认消息是否已经写入队列"
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodexQueueError(f"codex queue 调用失败: {exc}") from exc
+    if completed.returncode != 0:
+        detail = summarize_codex_error(completed.stderr or completed.stdout)
+        raise CodexQueueError(
+            f"codex queue 退出码 {completed.returncode}: {detail}"
+        )
+    return (completed.stdout or "").strip()
+
+
 class CodexRunner:
     transport_name = "exec"
 
@@ -1078,6 +1284,9 @@ class CodexRunner:
     def termination_reason(self) -> str:
         with self._lock:
             return self._termination_reason
+
+    def active_thread_id(self) -> str:
+        return ""
 
     def _execute(
         self,
@@ -1173,7 +1382,7 @@ class CodexRunner:
                         except Exception as exc:
                             log_event(
                                 "codex-diagnostic",
-                                f"callback failed: {exc}",
+                                f"回调失败：{exc}",
                                 level="ERROR",
                             )
             except (OSError, ValueError) as exc:
@@ -1298,7 +1507,7 @@ class CodexRunner:
 
 
 class CodexDesktopRefresher:
-    """Fail closed until Desktop exposes a non-destructive synchronization API."""
+    """在 Desktop 提供无损同步 API 前保持关闭状态。"""
 
     def __init__(
         self,
@@ -1315,10 +1524,10 @@ class CodexDesktopRefresher:
 
     def refresh(self, thread_id: str, workdir: Optional[Path] = None) -> bool:
         if not self.enabled:
-            self.last_detail = "disabled"
+            self.last_detail = "已禁用"
             return False
         self.last_detail = (
-            "automatic Desktop sync unavailable: no non-destructive Desktop API"
+            "Desktop 自动同步不可用：当前没有无损 Desktop API"
         )
         return False
 
@@ -1711,7 +1920,7 @@ def qq_safe_final(
     max_images: int = 3,
     visualizations_dir: Optional[Path] = None,
 ) -> Tuple[str, List[Path]]:
-    """Extract safe local Markdown images and redact local paths from QQ text."""
+    """提取安全的本地 Markdown 图片，并从 QQ 文本中移除本地路径。"""
     roots = [workdir.expanduser().resolve()]
     roots.append(
         (visualizations_dir or Path.home() / ".codex" / "visualizations")
